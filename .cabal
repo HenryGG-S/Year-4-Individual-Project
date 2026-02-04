@@ -1,0 +1,5 @@
+build-depends:
+    base,
+    bytestring,
+    stm,
+    network

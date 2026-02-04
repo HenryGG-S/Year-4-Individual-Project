@@ -9,7 +9,7 @@ import Control.Monad (forever, void)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import Network.Socket
-import qualified Network.Socket.ByteString as NBS
+import qualified Network.Socket.Bytestring as NBS
 import System.Timeout (timeout)
 
 data Config = Config
