@@ -6,7 +6,6 @@ module Http.Response
 
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
-import qualified Data.ByteString.Char8 as B8
 
 data Status = Status !Int !BS.ByteString
 
@@ -16,6 +15,9 @@ badRequest       = Status 400 "Bad Request"
 notFound         = Status 404 "Not Found"
 methodNotAllowed = Status 405 "Method Not Allowed"
 
+-- | Build an HTTP/1.1 response.
+-- The caller supplies headers (including Connection) so the server can decide
+-- keep-alive vs close per request.
 mkResponse :: Status -> [(BS.ByteString, BS.ByteString)] -> BS.ByteString -> Bool -> BB.Builder
 mkResponse (Status code msg) headers body sendBody =
   let len = BS.length body
@@ -28,8 +30,12 @@ mkResponse (Status code msg) headers body sendBody =
         , "Content-Length: "
         , BB.intDec len
         , "\r\n"
-        , "Connection: close\r\n"   -- Slice 1.5: we’ll override later per-request
         ]
-      hdrs = concatMap (\(k,v) -> [BB.byteString k, ": ", BB.byteString v, "\r\n"]) headers
-  in mconcat (base ++ hdrs ++ ["\r\n"] ++ [if sendBody then BB.byteString body else mempty])
+      hdrs =
+        concatMap
+          (\(k,v) -> [BB.byteString k, ": ", BB.byteString v, "\r\n"])
+          headers
+      end = ["\r\n"]
+      payload = if sendBody then [BB.byteString body] else []
+  in mconcat (base ++ hdrs ++ end ++ payload)
 

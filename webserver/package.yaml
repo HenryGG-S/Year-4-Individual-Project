@@ -39,6 +39,12 @@ ghc-options:
 
 library:
   source-dirs: src
+  exposed-modules:
+    - Lib
+    - Server
+    - Http.Types
+    - Http.Parse
+    - Http.Response
 
 executables:
   webserver-exe:
