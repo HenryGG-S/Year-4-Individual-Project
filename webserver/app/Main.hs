@@ -1,6 +1,7 @@
-module Main (main) where
+module Main where
 
-import Lib
+import Server (runServer)
 
 main :: IO ()
-main = someFunc
+main = runServer "8080"
+
