@@ -6,7 +6,11 @@ module Http.Types
 import qualified Data.ByteString as BS
 import qualified Data.CaseInsensitive as CI
 
-data Method = GET | HEAD deriving (Eq, Show)
+data Method
+  = GET
+  | HEAD
+  | Other !BS.ByteString
+  deriving (Eq, Show)
 
 type Header = (CI.CI BS.ByteString, BS.ByteString)
 

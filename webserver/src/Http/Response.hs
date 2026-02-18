@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Http.Response
-  ( Status(..), ok, badRequest, notFound, methodNotAllowed
+  ( Status(..), ok, badRequest, notFound, methodNotAllowed, requestHeaderFieldsTooLarge
   , mkResponse
   ) where
 
@@ -38,4 +38,7 @@ mkResponse (Status code msg) headers body sendBody =
       end = ["\r\n"]
       payload = if sendBody then [BB.byteString body] else []
   in mconcat (base ++ hdrs ++ end ++ payload)
+
+requestHeaderFieldsTooLarge :: Status
+requestHeaderFieldsTooLarge = Status 431 "Request Header Fields Too Large"
 

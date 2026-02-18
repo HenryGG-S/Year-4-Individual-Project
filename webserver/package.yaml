@@ -37,6 +37,10 @@ ghc-options:
 - -Wpartial-fields
 - -Wredundant-constraints
 
+default-extensions:
+  - OverloadedStrings
+  - NumericUnderscores
+
 library:
   source-dirs: src
   exposed-modules:
@@ -51,6 +55,8 @@ executables:
     main:                Main.hs
     source-dirs:         app
     ghc-options:
+    - -O2
+    - -Wall
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
@@ -62,8 +68,12 @@ tests:
     main:                Spec.hs
     source-dirs:         test
     ghc-options:
+    - -O2
+    - -Wall
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
     - webserver
+    - bytestring
+    - network

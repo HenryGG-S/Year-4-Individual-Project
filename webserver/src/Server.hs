@@ -1,22 +1,41 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Server (runServer) where
+{-# LANGUAGE ScopedTypeVariables #-}
+module Server
+  ( runServer
+  , startServer      -- for tests
+  ) where
 
-import Control.Concurrent (forkFinally)
-import Control.Exception (bracket)
+import Control.Concurrent (forkFinally, threadDelay)
+import Control.Exception (bracket, catch, IOException)
 import qualified Data.Attoparsec.ByteString as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
+import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as LBS
 import qualified Network.Socket as NS
 import qualified Network.Socket.ByteString as NSB
+import System.Timeout (timeout)
 
+import Http.Types
 import Http.Parse
 import Http.Response
-import Http.Types
+
+-- ===== Public API =====
 
 runServer :: String -> IO ()
 runServer port =
   NS.withSocketsDo $ bracket (open port) NS.close acceptLoop
+
+-- Start on a port (use "0" for ephemeral) and return (chosenPort, stopAction).
+startServer :: String -> IO (Int, IO ())
+startServer port = do
+  sock <- open port
+  chosen <- socketPort sock
+  done <- forkFinally (acceptLoop sock) (\_ -> pure ())
+  let stop = NS.close sock >> pure ()
+  pure (chosen, stop)
+
+-- ===== Socket setup =====
 
 open :: String -> IO NS.Socket
 open port = do
@@ -33,11 +52,22 @@ open port = do
   NS.setSocketOption s NS.ReuseAddr 1
   NS.bind s (NS.addrAddress addr)
   NS.listen s 1024
-  putStrLn ("Listening on :" <> port)
+  putStrLn ("Listening on :" <> showSockPort s)
   pure s
 
+showSockPort :: NS.Socket -> String
+showSockPort s = "<bound>"
+
+socketPort :: NS.Socket -> IO Int
+socketPort s = do
+  sa <- NS.getSocketName s
+  case sa of
+    NS.SockAddrInet p _      -> pure (fromIntegral p)
+    NS.SockAddrInet6 p _ _ _ -> pure (fromIntegral p)
+    _                        -> pure 0
+
 acceptLoop :: NS.Socket -> IO ()
-acceptLoop s = go
+acceptLoop s = go `catch` (\(_ :: IOException) -> pure ())
   where
     go = do
       (c, _peer) <- NS.accept s
@@ -50,78 +80,104 @@ handleConn :: NS.Socket -> IO ()
 handleConn c = connLoop BS.empty
   where
     connLoop buf = do
-      r <- readOneRequest c buf
-      case r of
-        Left ParseErr -> do
-          sendBuilder c (responseFor badRequest "Bad Request\n" True Close)
-          pure ()
+      res <- readOneRequest c buf
+      case res of
+        Left e -> do
+          -- 431 for size/headers; 400 for parse
+          let (st, msg) = case e of
+                TooLarge -> (requestHeaderFieldsTooLarge, "Header fields too large\n")
+                ParseErr -> (badRequest, "Bad Request\n")
+                TimedOut -> (badRequest, "Request Timeout\n")
+          sendBuilder c (responseFor st msg True Close [])
         Right (Nothing, _rest) ->
-          pure () -- client closed cleanly
+          pure ()
         Right (Just req, rest) -> do
+          -- Minimal compliance for scoped subset
           if not (requireHost req)
             then do
-              sendBuilder c (responseFor badRequest "Missing Host\n" True Close)
+              sendBuilder c (responseFor badRequest "Missing Host\n" True Close [])
               pure ()
-            else do
-              let (st, body) = route req
-                  pref       = connectionPref req
-                  sendBody   = rqMethod req /= HEAD
+            else if hasBody req
+              then do
+                sendBuilder c (responseFor badRequest "Request bodies not supported\n" True Close [])
+                pure ()
+            else case rqMethod req of
+              Other _ -> do
+                sendBuilder c (responseFor methodNotAllowed "Method Not Allowed\n" True Close
+                                [("Allow","GET, HEAD")])
+                pure ()
+              _ -> do
+                let (st, body) = route req
+                    pref       = connectionPref req
+                    sendBody   = rqMethod req /= HEAD
+                sendBuilder c (responseFor st body sendBody pref [])
+                case pref of
+                  Close     -> pure ()
+                  KeepAlive -> connLoop rest
 
-              sendBuilder c (responseFor st body sendBody pref)
+hasBody :: Request -> Bool
+hasBody req =
+  case headerLookup "Transfer-Encoding" (rqHeaders req) of
+    Just _ -> True
+    Nothing ->
+      case headerLookup "Content-Length" (rqHeaders req) of
+        Nothing -> False
+        Just v  ->
+          case B8.readInt (trimOWS v) of
+            Just (n, _) -> n > 0
+            Nothing     -> True
+  where
+    trimOWS = B8.dropWhile (\c -> c == ' ' || c == '\t')
+           . B8.reverse . B8.dropWhile (\c -> c == ' ' || c == '\t') . B8.reverse
 
-              case pref of
-                Close     -> pure ()
-                KeepAlive -> connLoop rest
-
--- ===== Routing (placeholder) =====
+-- ===== Routing (still placeholder) =====
 
 route :: Request -> (Status, BS.ByteString)
 route req =
-  case rqMethod req of
-    GET  -> pathRoute (rqTarget req)
-    HEAD -> pathRoute (rqTarget req)
-  where
-    pathRoute "/"       = (ok, "ok\n")
-    pathRoute "/health" = (ok, "healthy\n")
-    pathRoute _         = (notFound, "not found\n")
+  case rqTarget req of
+    "/"       -> (ok, "ok\n")
+    "/health" -> (ok, "healthy\n")
+    _         -> (notFound, "not found\n")
 
 -- ===== Response helpers =====
 
-responseFor :: Status -> BS.ByteString -> Bool -> ConnectionPref -> BB.Builder
-responseFor st body sendBody pref =
+responseFor :: Status -> BS.ByteString -> Bool -> ConnectionPref -> [(BS.ByteString, BS.ByteString)] -> BB.Builder
+responseFor st body sendBody pref extra =
   let connHdr =
         case pref of
           KeepAlive -> ("Connection", "keep-alive")
           Close     -> ("Connection", "close")
-  in mkResponse st [("Content-Type", "text/plain; charset=utf-8"), connHdr] body sendBody
+      headers = [("Content-Type","text/plain; charset=utf-8"), connHdr] <> extra
+  in mkResponse st headers body sendBody
 
--- ===== Incremental parse with bounds =====
+-- ===== Incremental parse with bounds + timeout =====
 
-data ReadError = ParseErr deriving (Eq, Show)
+data ReadError = ParseErr | TooLarge | TimedOut deriving (Eq, Show)
 
 maxHeaderBytes :: Int
 maxHeaderBytes = 8192
 
--- Returns:
---   Left ParseErr                  -> malformed request / headers too large
---   Right (Nothing, _)             -> client closed
---   Right (Just req, remainingBuf) -> parsed one request, leftover bytes for next request
+recvTimeoutMicros :: Int
+recvTimeoutMicros = 5_000_000  -- 5s
+
 readOneRequest :: NS.Socket -> BS.ByteString -> IO (Either ReadError (Maybe Request, BS.ByteString))
 readOneRequest c buf0 = step buf0 (A.parse requestP buf0)
   where
     step buf (A.Done rest req) = pure (Right (Just req, rest))
     step _   (A.Fail _ _ _)    = pure (Left ParseErr)
     step buf (A.Partial k) = do
-      -- hard bound to avoid unbounded header growth
       if BS.length buf > maxHeaderBytes
-        then pure (Left ParseErr)
+        then pure (Left TooLarge)
         else do
-          chunk <- NSB.recv c 4096
-          if BS.null chunk
-            then pure (Right (Nothing, BS.empty))
-            else
-              let buf' = buf <> chunk
-              in step buf' (k chunk)
+          mch <- timeout recvTimeoutMicros (NSB.recv c 4096)
+          case mch of
+            Nothing    -> pure (Left TimedOut)
+            Just chunk ->
+              if BS.null chunk
+                then pure (Right (Nothing, BS.empty))
+                else
+                  let buf' = buf <> chunk
+                  in step buf' (k chunk)
 
 -- ===== Builder send =====
 
