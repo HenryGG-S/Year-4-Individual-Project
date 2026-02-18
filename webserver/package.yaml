@@ -25,6 +25,10 @@ dependencies:
   - network
   - attoparsec
   - case-insensitive
+  - wai
+  - warp
+  - http-types
+  - text
 
 ghc-options:
 - -Wall
@@ -49,19 +53,37 @@ library:
     - Http.Types
     - Http.Parse
     - Http.Response
+    - Workloads
 
 executables:
   webserver-exe:
-    main:                Main.hs
-    source-dirs:         app
-    ghc-options:
-    - -O2
-    - -Wall
-    - -threaded
-    - -rtsopts
-    - -with-rtsopts=-N
+    main: Main.hs
+    source-dirs: app
     dependencies:
-    - webserver
+      - webserver
+    ghc-options:
+      - -O2
+      - -Wall
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+
+  warp-baseline:
+    main: Main.hs
+    source-dirs: app-warp
+    dependencies:
+      - webserver
+      - wai
+      - warp
+      - http-types
+      - text
+    ghc-options:
+      - -O2
+      - -Wall
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+
 
 tests:
   webserver-test:

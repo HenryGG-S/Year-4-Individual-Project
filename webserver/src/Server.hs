@@ -1,12 +1,11 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 module Server
   ( runServer
   , startServer      -- for tests
   ) where
 
-import Control.Concurrent (forkFinally, threadDelay)
-import Control.Exception (bracket, catch, IOException)
+import Control.Concurrent (forkFinally)
+import Control.Exception (IOException, bracket, catch)
 import qualified Data.Attoparsec.ByteString as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -19,6 +18,7 @@ import System.Timeout (timeout)
 import Http.Types
 import Http.Parse
 import Http.Response
+import Workloads (json1k, file50k, file1m)
 
 -- ===== Public API =====
 
@@ -31,7 +31,7 @@ startServer :: String -> IO (Int, IO ())
 startServer port = do
   sock <- open port
   chosen <- socketPort sock
-  done <- forkFinally (acceptLoop sock) (\_ -> pure ())
+  _ <- forkFinally (acceptLoop sock) (\_ -> pure ())
   let stop = NS.close sock >> pure ()
   pure (chosen, stop)
 
@@ -52,11 +52,10 @@ open port = do
   NS.setSocketOption s NS.ReuseAddr 1
   NS.bind s (NS.addrAddress addr)
   NS.listen s 1024
-  putStrLn ("Listening on :" <> showSockPort s)
-  pure s
 
-showSockPort :: NS.Socket -> String
-showSockPort s = "<bound>"
+  p <- socketPort s
+  putStrLn ("Listening on :" <> show p)
+  pure s
 
 socketPort :: NS.Socket -> IO Int
 socketPort s = do
@@ -67,8 +66,11 @@ socketPort s = do
     _                        -> pure 0
 
 acceptLoop :: NS.Socket -> IO ()
-acceptLoop s = go `catch` (\(_ :: IOException) -> pure ())
+acceptLoop s = go `catch` handler
   where
+    handler :: IOException -> IO ()
+    handler _ = pure ()
+
     go = do
       (c, _peer) <- NS.accept s
       _ <- forkFinally (handleConn c) (\_ -> NS.close c)
@@ -83,34 +85,33 @@ handleConn c = connLoop BS.empty
       res <- readOneRequest c buf
       case res of
         Left e -> do
-          -- 431 for size/headers; 400 for parse
-          let (st, msg) = case e of
-                TooLarge -> (requestHeaderFieldsTooLarge, "Header fields too large\n")
-                ParseErr -> (badRequest, "Bad Request\n")
-                TimedOut -> (badRequest, "Request Timeout\n")
-          sendBuilder c (responseFor st msg True Close [])
+          let (st, msg) =
+                case e of
+                  TooLarge -> (requestHeaderFieldsTooLarge, "Header fields too large\n")
+                  ParseErr -> (badRequest, "Bad Request\n")
+                  TimedOut -> (badRequest, "Request Timeout\n")
+          sendBuilder c (responseFor st ctText msg True Close [])
         Right (Nothing, _rest) ->
           pure ()
         Right (Just req, rest) -> do
-          -- Minimal compliance for scoped subset
           if not (requireHost req)
             then do
-              sendBuilder c (responseFor badRequest "Missing Host\n" True Close [])
+              sendBuilder c (responseFor badRequest ctText "Missing Host\n" True Close [])
               pure ()
             else if hasBody req
               then do
-                sendBuilder c (responseFor badRequest "Request bodies not supported\n" True Close [])
+                sendBuilder c (responseFor badRequest ctText "Request bodies not supported\n" True Close [])
                 pure ()
             else case rqMethod req of
               Other _ -> do
-                sendBuilder c (responseFor methodNotAllowed "Method Not Allowed\n" True Close
+                sendBuilder c (responseFor methodNotAllowed ctText "Method Not Allowed\n" True Close
                                 [("Allow","GET, HEAD")])
                 pure ()
               _ -> do
-                let (st, body) = route req
-                    pref       = connectionPref req
-                    sendBody   = rqMethod req /= HEAD
-                sendBuilder c (responseFor st body sendBody pref [])
+                let (st, ct, body) = route req
+                    pref            = connectionPref req
+                    sendBody        = rqMethod req /= HEAD
+                sendBuilder c (responseFor st ct body sendBody pref [])
                 case pref of
                   Close     -> pure ()
                   KeepAlive -> connLoop rest
@@ -130,25 +131,40 @@ hasBody req =
     trimOWS = B8.dropWhile (\c -> c == ' ' || c == '\t')
            . B8.reverse . B8.dropWhile (\c -> c == ' ' || c == '\t') . B8.reverse
 
--- ===== Routing (still placeholder) =====
+-- ===== Routing =====
 
-route :: Request -> (Status, BS.ByteString)
+ctText, ctJson, ctBin :: (BS.ByteString, BS.ByteString)
+ctText = ("Content-Type", "text/plain; charset=utf-8")
+ctJson = ("Content-Type", "application/json")
+ctBin  = ("Content-Type", "application/octet-stream")
+
+route :: Request -> (Status, (BS.ByteString, BS.ByteString), BS.ByteString)
 route req =
   case rqTarget req of
-    "/"       -> (ok, "ok\n")
-    "/health" -> (ok, "healthy\n")
-    _         -> (notFound, "not found\n")
+    "/"        -> (ok, ctText, "ok\n")
+    "/health"  -> (ok, ctText, "healthy\n")
+    "/json"    -> (ok, ctJson, json1k)
+    "/file50k" -> (ok, ctBin,  file50k)
+    "/file1m"  -> (ok, ctBin,  file1m)
+    _          -> (notFound, ctText, "not found\n")
 
 -- ===== Response helpers =====
 
-responseFor :: Status -> BS.ByteString -> Bool -> ConnectionPref -> [(BS.ByteString, BS.ByteString)] -> BB.Builder
-responseFor st body sendBody pref extra =
+responseFor
+  :: Status
+  -> (BS.ByteString, BS.ByteString)                -- Content-Type
+  -> BS.ByteString                                 -- body
+  -> Bool                                          -- send body?
+  -> ConnectionPref
+  -> [(BS.ByteString, BS.ByteString)]              -- extra headers
+  -> BB.Builder
+responseFor st ct body sendBody pref extra =
   let connHdr =
         case pref of
           KeepAlive -> ("Connection", "keep-alive")
           Close     -> ("Connection", "close")
-      headers = [("Content-Type","text/plain; charset=utf-8"), connHdr] <> extra
-  in mkResponse st headers body sendBody
+      hdrs = [ct] <> extra <> [connHdr]
+  in mkResponse st hdrs body sendBody
 
 -- ===== Incremental parse with bounds + timeout =====
 
@@ -158,14 +174,14 @@ maxHeaderBytes :: Int
 maxHeaderBytes = 8192
 
 recvTimeoutMicros :: Int
-recvTimeoutMicros = 5_000_000  -- 5s
+recvTimeoutMicros = 5000000 -- 5s
 
 readOneRequest :: NS.Socket -> BS.ByteString -> IO (Either ReadError (Maybe Request, BS.ByteString))
 readOneRequest c buf0 = step buf0 (A.parse requestP buf0)
   where
     step buf (A.Done rest req) = pure (Right (Just req, rest))
     step _   (A.Fail _ _ _)    = pure (Left ParseErr)
-    step buf (A.Partial k) = do
+    step buf (A.Partial k) =
       if BS.length buf > maxHeaderBytes
         then pure (Left TooLarge)
         else do

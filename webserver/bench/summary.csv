@@ -1,0 +1,5 @@
+timestamp,name,url,rate_rps,duration_s,threads,connections,requests,achieved_rps,p50_ms,p95_ms,p99_ms,p999_ms,err_connect,err_read,err_write,err_status,err_timeout,exit_code
+20260218_151000,lean_json,http://127.0.0.1:8080/json,2000,60,2,100,119803,1996.65,1.131,2.021,2.359,3.171,0,0,0,0,0,0
+20260218_151211,warp_json,http://127.0.0.1:8081/json,2000,60,2,100,119806,1996.68,1.107,2.027,2.325,2.617,0,0,0,0,0,0
+20260218_151329,lean_file1m,http://127.0.0.1:8080/file1m,50,60,2,50,3002,50.03,3.001,41.983,44.319,45.343,0,0,0,0,0,0
+20260218_151449,warp_file1m,http://127.0.0.1:8081/file1m,50,60,2,50,3002,50.03,2.651,3.521,3.903,4.387,0,0,0,0,0,0
