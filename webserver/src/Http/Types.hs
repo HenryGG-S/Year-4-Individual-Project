@@ -1,28 +1,30 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Http.Types
-  ( Method(..), Request(..), Header, headerLookup, ConnectionPref(..)
+  ( Method(..)
+  , RequestHead(..)
+  , Header
+  , headerLookup
+  , ConnectionPref(..)
   ) where
 
 import qualified Data.ByteString as BS
 import qualified Data.CaseInsensitive as CI
 
 data Method
-  = GET
-  | HEAD
+  = GET | HEAD | POST | PUT | DELETE | OPTIONS | PATCH | TRACE | CONNECT
   | Other !BS.ByteString
   deriving (Eq, Show)
 
 type Header = (CI.CI BS.ByteString, BS.ByteString)
 
-data Request = Request
-  { rqMethod  :: !Method
-  , rqTarget  :: !BS.ByteString
-  , rqVersion :: !BS.ByteString  -- "HTTP/1.1" or "HTTP/1.0"
-  , rqHeaders :: ![Header]
+data RequestHead = RequestHead
+  { rhMethod  :: !Method
+  , rhTarget  :: !BS.ByteString  -- raw request-target (we’ll normalise in routing)
+  , rhVersion :: !BS.ByteString
+  , rhHeaders :: ![Header]
   } deriving (Show)
 
 data ConnectionPref = KeepAlive | Close deriving (Eq, Show)
 
 headerLookup :: BS.ByteString -> [Header] -> Maybe BS.ByteString
 headerLookup name hs = lookup (CI.mk name) hs
-

@@ -224,3 +224,42 @@ testHeadJsonNoBody port =
         okLen    = expectContentLength 1024 out
     assert "HEAD /json has no body (but CL=1024)" (okStatus && okLen && BS.null after)
 
+testPostEchoCL :: Int -> IO Bool
+testPostEchoCL port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping"
+    mh <- recvHeaders s
+    case mh of
+      Nothing -> assert "POST /echo (CL) headers received" False
+      Just (hdrs, rest0) -> do
+        let okStatus = "HTTP/1.1 200 OK" `BS.isPrefixOf` hdrs
+            okLen    = expectContentLength 4 hdrs
+        let need = 4 - BS.length rest0
+        mb <- if need <= 0 then pure (Just (BS.take 4 rest0))
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
+        case mb of
+          Nothing   -> assert "POST /echo (CL) reads full body" False
+          Just body -> assert "POST /echo (CL) echoes body" (okStatus && okLen && body == "ping")
+
+testPostEchoChunked :: Int -> IO Bool
+testPostEchoChunked port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" <>
+      "4\r\nping\r\n0\r\n\r\n"
+    mh <- recvHeaders s
+    case mh of
+      Nothing -> assert "POST /echo (chunked) headers received" False
+      Just (hdrs, rest0) -> do
+        let okStatus = "HTTP/1.1 200 OK" `BS.isPrefixOf` hdrs
+            okLen    = expectContentLength 4 hdrs
+        let need = 4 - BS.length rest0
+        mb <- if need <= 0 then pure (Just (BS.take 4 rest0))
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
+        case mb of
+          Nothing   -> assert "POST /echo (chunked) reads full body" False
+          Just body -> assert "POST /echo (chunked) echoes body" (okStatus && okLen && body == "ping")
+

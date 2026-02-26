@@ -29,6 +29,8 @@ dependencies:
   - warp
   - http-types
   - text
+  - directory
+  - filepath
 
 ghc-options:
 - -Wall

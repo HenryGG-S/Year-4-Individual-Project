@@ -1,6 +1,6 @@
 cabal-version: 2.2
 
--- This file has been generated from package.yaml by hpack version 0.38.1.
+-- This file has been generated from package.yaml by hpack version 0.39.1.
 --
 -- see: https://github.com/sol/hpack
 
@@ -32,6 +32,8 @@ library
       Http.Response
       Workloads
   other-modules:
+      Http.Body
+      Http.Framing
       Paths_webserver
   autogen-modules:
       Paths_webserver
@@ -46,6 +48,8 @@ library
     , base >=4.14 && <5
     , bytestring
     , case-insensitive
+    , directory
+    , filepath
     , http-types
     , network
     , text
@@ -70,6 +74,8 @@ executable warp-baseline
     , base >=4.14 && <5
     , bytestring
     , case-insensitive
+    , directory
+    , filepath
     , http-types
     , network
     , text
@@ -95,6 +101,8 @@ executable webserver-exe
     , base >=4.14 && <5
     , bytestring
     , case-insensitive
+    , directory
+    , filepath
     , http-types
     , network
     , text
@@ -121,6 +129,8 @@ test-suite webserver-test
     , base >=4.14 && <5
     , bytestring
     , case-insensitive
+    , directory
+    , filepath
     , http-types
     , network
     , text

@@ -1,8 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Http.Parse
-  ( requestP
+  ( requestHeadP
   , connectionPref
   , requireHost
+  , normalisedPath
   ) where
 
 import Control.Applicative ((<|>))
@@ -12,25 +13,30 @@ import qualified Data.ByteString as BS
 import qualified Data.CaseInsensitive as CI
 import Http.Types
 
--- ===== Config bounds =====
-
+-- ===== bounds =====
 maxHeaders :: Int
 maxHeaders = 100
 
--- ===== Parser =====
-
-requestP :: A.Parser Request
-requestP = do
+requestHeadP :: A.Parser RequestHead
+requestHeadP = do
   mTok <- tokenTillSP <* AC.char ' '
   let m = case mTok of
-            "GET"  -> GET
-            "HEAD" -> HEAD
-            _      -> Other mTok
+            "GET"     -> GET
+            "HEAD"    -> HEAD
+            "POST"    -> POST
+            "PUT"     -> PUT
+            "DELETE"  -> DELETE
+            "OPTIONS" -> OPTIONS
+            "PATCH"   -> PATCH
+            "TRACE"   -> TRACE
+            "CONNECT" -> CONNECT
+            _         -> Other mTok
+
   tgt <- takeTillSP <* AC.char ' '
   ver <- httpVersionP <* crlf
   hs  <- headersP
   _   <- crlf
-  pure (Request m tgt ver hs)
+  pure (RequestHead m tgt ver hs)
 
 httpVersionP :: A.Parser BS.ByteString
 httpVersionP =
@@ -40,11 +46,10 @@ httpVersionP =
 headersP :: A.Parser [Header]
 headersP = go 0 []
   where
-    go :: Int -> [Header] -> A.Parser [Header]
     go n acc = do
       mw <- A.peekWord8
       case mw of
-        Just 13 -> pure (reverse acc)  -- '\r' => CRLF => end of headers
+        Just 13 -> pure (reverse acc) -- '\r' => end headers
         _ ->
           if n >= maxHeaders
             then fail "too many headers"
@@ -62,7 +67,7 @@ headerP = do
   pure (CI.mk name, val)
 
 fieldNameP :: A.Parser BS.ByteString
-fieldNameP = A.takeWhile1 (\c -> c >= 33 && c <= 126 && c /= 58) -- visible ASCII excluding ':'
+fieldNameP = A.takeWhile1 (\c -> c >= 33 && c <= 126 && c /= 58)
 
 tokenTillSP :: A.Parser BS.ByteString
 tokenTillSP = A.takeWhile1 (/= 32)
@@ -79,34 +84,52 @@ ows = A.skipWhile (\c -> c == 32 || c == 9)
 crlf :: A.Parser ()
 crlf = AC.string "\r\n" *> pure ()
 
--- ===== Semantics =====
-
-connectionPref :: Request -> ConnectionPref
+connectionPref :: RequestHead -> ConnectionPref
 connectionPref req =
-  case rqVersion req of
+  case rhVersion req of
     "HTTP/1.1" ->
-      case headerLookup "Connection" (rqHeaders req) of
+      case headerLookup "Connection" (rhHeaders req) of
         Just v | hasTokenCI "close" v -> Close
         _                              -> KeepAlive
     "HTTP/1.0" ->
-      case headerLookup "Connection" (rqHeaders req) of
+      case headerLookup "Connection" (rhHeaders req) of
         Just v | hasTokenCI "keep-alive" v -> KeepAlive
         _                                   -> Close
     _ -> Close
 
-requireHost :: Request -> Bool
+requireHost :: RequestHead -> Bool
 requireHost req =
-  rqVersion req /= "HTTP/1.1" || headerLookup "Host" (rqHeaders req) /= Nothing
+  rhVersion req /= "HTTP/1.1" || headerLookup "Host" (rhHeaders req) /= Nothing
 
--- Comma-separated tokens; trim OWS; case-insensitive compare.
 hasTokenCI :: BS.ByteString -> BS.ByteString -> Bool
 hasTokenCI tok raw =
-  let parts = map trimOWS (BS.split 44 raw) -- ','
-      toks  = map (CI.mk . takeToken) parts
+  let toks = map (CI.mk . trimOWS . takeToken) (BS.split 44 raw)
   in CI.mk tok `elem` toks
   where
     takeToken = BS.takeWhile (\c -> c /= 32 && c /= 9)
-    trimOWS = dropWhileOWS . dropWhileEndOWS
-    dropWhileOWS = BS.dropWhile (\c -> c == 32 || c == 9)
-    dropWhileEndOWS bs = BS.reverse (BS.dropWhile (\c -> c == 32 || c == 9) (BS.reverse bs))
 
+trimOWS :: BS.ByteString -> BS.ByteString
+trimOWS = dropStart . dropEnd
+  where
+    isOWS c = c == 32 || c == 9
+    dropStart = BS.dropWhile isOWS
+    dropEnd b = BS.reverse (BS.dropWhile isOWS (BS.reverse b))
+
+-- Minimal target normalisation for origin server:
+-- - origin-form "/path?x" => unchanged
+-- - absolute-form "http://host/path" => extract "/path" (or "/" if none)
+-- - asterisk "*" => "*"
+-- - authority-form "host:port" (CONNECT) => "" (route to 501)
+normalisedPath :: BS.ByteString -> BS.ByteString
+normalisedPath tgt
+  | tgt == "*" = "*"
+  | BS.isPrefixOf "/" tgt = tgt
+  | BS.isPrefixOf "http://" tgt = absToPath (BS.drop 7 tgt)
+  | BS.isPrefixOf "https://" tgt = absToPath (BS.drop 8 tgt)
+  | otherwise = ""  -- authority-form or garbage
+  where
+    absToPath rest =
+      case BS.break (== 47) rest of -- '/'
+        (_auth, p)
+          | BS.null p  -> "/"
+          | otherwise  -> p
