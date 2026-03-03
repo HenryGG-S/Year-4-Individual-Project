@@ -10,6 +10,7 @@ import Control.Exception (catch, IOException)
 import qualified Data.ByteString as BS
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
+import System.IO (IOMode(ReadMode), withBinaryFile)
 
 data BenchPayloads = BenchPayloads
   { bpJson1k  :: !BS.ByteString
@@ -79,9 +80,8 @@ ensureRandom p n = do
   if ok
     then pure ()
     else do
-      -- "arbitrary" bytes without extra deps: read from /dev/urandom
-      bytes <- BS.readFile "/dev/urandom" >>= \src ->
-        pure (BS.take n src)
+      bytes <- withBinaryFile "/dev/urandom" ReadMode $ \h ->
+        BS.hGet h n
       if BS.length bytes == n
         then BS.writeFile p bytes
         else BS.writeFile p (BS.replicate n 90) -- fallback 'Z'
@@ -89,10 +89,13 @@ ensureRandom p n = do
 fileSizeIs :: FilePath -> Int -> IO Bool
 fileSizeIs p n =
   (do ex <- Dir.doesFileExist p
-      if not ex then pure False
-      else do sz <- Dir.getFileSize p
-              pure (fromIntegral sz == n)
-  ) `catch` handler
+      if not ex
+        then pure False
+        else do
+          sz <- Dir.getFileSize p
+          pure (fromIntegral sz == n)
+  ) `catch`  handler
     where
         handler :: IOException -> IO Bool
         handler _ = pure False
+
