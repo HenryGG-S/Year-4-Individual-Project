@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Main where
+module Main (main) where
 
 import Control.Exception (bracket)
 import qualified Data.ByteString as BS
@@ -14,8 +14,6 @@ import Server (startServer)
 main :: IO ()
 main = do
   (port, stop) <- startServer "0"
-  -- tiny delay to ensure accept loop is live
-  _ <- timeout 200000 (pure ())  -- no-op
   ok <- runAll port
   stop
   if ok then putStrLn "OK" else exitFailure
@@ -31,6 +29,17 @@ runAll port = and <$> sequence
   , testFile50k port
   , testFile1m port
   , testHeadJsonNoBody port
+
+  -- Bodies + framing (general-purpose)
+  , testPostEchoCL port
+  , testPostEchoChunked port
+  , testExpect100ContinueEcho port
+  , testFramingConflictTECL port
+
+  -- Filesystem-backed methods (general-purpose semantics)
+  , testFsPutGetDeleteCL port
+  , testFsPutChunked port
+  , testFsPathTraversalRejected port
   ]
 
 -- ===== Helpers =====
@@ -74,20 +83,23 @@ countSub needle hay
 
 -- Read until we have headers (\r\n\r\n). Returns (headersIncludingMarker, initialBodyBytes).
 recvHeaders :: NS.Socket -> IO (Maybe (BS.ByteString, BS.ByteString))
-recvHeaders s = go BS.empty
+recvHeaders = recvHeadersWith BS.empty
+
+-- Same, but begins with a provided buffer (useful when a previous read left extra bytes).
+recvHeadersWith :: BS.ByteString -> NS.Socket -> IO (Maybe (BS.ByteString, BS.ByteString))
+recvHeadersWith initial s = go initial
   where
-    go acc = do
-      m <- timeout 1000000 (NSB.recv s 4096)
-      case m of
-        Nothing -> pure Nothing
-        Just bs
-          | BS.null bs -> pure Nothing
-          | otherwise  ->
-              let acc' = acc <> bs
-                  (pre, rest) = B8.breakSubstring "\r\n\r\n" acc'
-              in if BS.null rest
-                    then go acc'
-                    else pure (Just (pre <> "\r\n\r\n", BS.drop 4 rest))
+    go acc =
+      let (pre, rest) = B8.breakSubstring "\r\n\r\n" acc
+      in if not (BS.null rest)
+           then pure (Just (pre <> "\r\n\r\n", BS.drop 4 rest))
+           else do
+             m <- timeout 1000000 (NSB.recv s 4096)
+             case m of
+               Nothing -> pure Nothing
+               Just bs
+                 | BS.null bs -> pure Nothing
+                 | otherwise  -> go (acc <> bs)
 
 recvExactly :: NS.Socket -> Int -> IO (Maybe BS.ByteString)
 recvExactly _ 0 = pure (Just BS.empty)
@@ -108,14 +120,18 @@ expectContentLength n hdrs =
   let needle = "Content-Length: " <> B8.pack (show n) <> "\r\n"
   in needle `BS.isInfixOf` hdrs
 
--- ===== Tests =====
+statusIs :: BS.ByteString -> BS.ByteString -> Bool
+statusIs code hdrs = ("HTTP/1.1 " <> code) `BS.isPrefixOf` hdrs
+
+-- ===== Existing tests (unchanged) =====
 
 testGetRoot :: Int -> IO Bool
 testGetRoot port =
   withConn port $ \s -> do
     NSB.sendAll s "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     out <- recvUntilQuiet s
-    assert "GET / returns 200" ( "HTTP/1.1 200 OK" `BS.isPrefixOf` out && "ok\n" `BS.isInfixOf` out )
+    assert "GET / returns 200"
+      ("HTTP/1.1 200 OK" `BS.isPrefixOf` out && "ok\n" `BS.isInfixOf` out)
 
 testHeadNoBody :: Int -> IO Bool
 testHeadNoBody port =
@@ -124,7 +140,8 @@ testHeadNoBody port =
     out <- recvUntilQuiet s
     let (_pre, rest) = B8.breakSubstring "\r\n\r\n" out
         after = BS.drop 4 rest
-    assert "HEAD / has no body" ("HTTP/1.1 200 OK" `BS.isPrefixOf` out && BS.null after)
+    assert "HEAD / has no body"
+      ("HTTP/1.1 200 OK" `BS.isPrefixOf` out && BS.null after)
 
 testMissingHost400 :: Int -> IO Bool
 testMissingHost400 port =
@@ -141,7 +158,8 @@ testPipelineTwoRequests port =
       "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     out <- recvUntilQuiet s
     let n200 = countSub "HTTP/1.1 200 OK" out
-    assert "pipelined GETs produce two 200 responses" (n200 == 2 && "healthy\n" `BS.isInfixOf` out)
+    assert "pipelined GETs produce two 200 responses"
+      (n200 == 2 && "healthy\n" `BS.isInfixOf` out)
 
 testConnectionClose :: Int -> IO Bool
 testConnectionClose port =
@@ -162,15 +180,14 @@ testJson1k port =
     case mh of
       Nothing -> assert "GET /json headers received" False
       Just (hdrs, rest0) -> do
-        let okStatus = "HTTP/1.1 200 OK" `BS.isPrefixOf` hdrs
+        let okStatus = statusIs "200 OK" hdrs
             okLen    = expectContentLength 1024 hdrs
-        let need = 1024 - BS.length rest0
+            need     = 1024 - BS.length rest0
         mb <- if need <= 0 then pure (Just (BS.take 1024 rest0))
-                           else do
-                             mmore <- recvExactly s need
-                             pure ((rest0 <>) <$> mmore)
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
         case mb of
-          Nothing -> assert "GET /json reads full body" False
+          Nothing   -> assert "GET /json reads full body" False
           Just body -> assert "GET /json is 1024 bytes" (okStatus && okLen && BS.length body == 1024)
 
 testFile50k :: Int -> IO Bool
@@ -181,16 +198,15 @@ testFile50k port =
     case mh of
       Nothing -> assert "GET /file50k headers received" False
       Just (hdrs, rest0) -> do
-        let okStatus = "HTTP/1.1 200 OK" `BS.isPrefixOf` hdrs
+        let okStatus = statusIs "200 OK" hdrs
             okLen    = expectContentLength 51200 hdrs
-        let total = 51200
-            need  = total - BS.length rest0
+            total    = 51200
+            need     = total - BS.length rest0
         mb <- if need <= 0 then pure (Just (BS.take total rest0))
-                           else do
-                             mmore <- recvExactly s need
-                             pure ((rest0 <>) <$> mmore)
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
         case mb of
-          Nothing -> assert "GET /file50k reads full body" False
+          Nothing   -> assert "GET /file50k reads full body" False
           Just body -> assert "GET /file50k is 50KiB" (okStatus && okLen && BS.length body == total)
 
 testFile1m :: Int -> IO Bool
@@ -201,16 +217,15 @@ testFile1m port =
     case mh of
       Nothing -> assert "GET /file1m headers received" False
       Just (hdrs, rest0) -> do
-        let okStatus = "HTTP/1.1 200 OK" `BS.isPrefixOf` hdrs
+        let okStatus = statusIs "200 OK" hdrs
             okLen    = expectContentLength 1048576 hdrs
-        let total = 1048576
-            need  = total - BS.length rest0
+            total    = 1048576
+            need     = total - BS.length rest0
         mb <- if need <= 0 then pure (Just (BS.take total rest0))
-                           else do
-                             mmore <- recvExactly s need
-                             pure ((rest0 <>) <$> mmore)
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
         case mb of
-          Nothing -> assert "GET /file1m reads full body" False
+          Nothing   -> assert "GET /file1m reads full body" False
           Just body -> assert "GET /file1m is 1MiB" (okStatus && okLen && BS.length body == total)
 
 testHeadJsonNoBody :: Int -> IO Bool
@@ -220,9 +235,11 @@ testHeadJsonNoBody port =
     out <- recvUntilQuiet s
     let (_pre, rest) = B8.breakSubstring "\r\n\r\n" out
         after = BS.drop 4 rest
-        okStatus = "HTTP/1.1 200 OK" `BS.isPrefixOf` out
+        okStatus = statusIs "200 OK" out
         okLen    = expectContentLength 1024 out
     assert "HEAD /json has no body (but CL=1024)" (okStatus && okLen && BS.null after)
+
+-- ===== New: Bodies + framing =====
 
 testPostEchoCL :: Int -> IO Bool
 testPostEchoCL port =
@@ -233,9 +250,9 @@ testPostEchoCL port =
     case mh of
       Nothing -> assert "POST /echo (CL) headers received" False
       Just (hdrs, rest0) -> do
-        let okStatus = "HTTP/1.1 200 OK" `BS.isPrefixOf` hdrs
+        let okStatus = statusIs "200 OK" hdrs
             okLen    = expectContentLength 4 hdrs
-        let need = 4 - BS.length rest0
+            need     = 4 - BS.length rest0
         mb <- if need <= 0 then pure (Just (BS.take 4 rest0))
                            else do mmore <- recvExactly s need
                                    pure ((rest0 <>) <$> mmore)
@@ -253,9 +270,9 @@ testPostEchoChunked port =
     case mh of
       Nothing -> assert "POST /echo (chunked) headers received" False
       Just (hdrs, rest0) -> do
-        let okStatus = "HTTP/1.1 200 OK" `BS.isPrefixOf` hdrs
+        let okStatus = statusIs "200 OK" hdrs
             okLen    = expectContentLength 4 hdrs
-        let need = 4 - BS.length rest0
+            need     = 4 - BS.length rest0
         mb <- if need <= 0 then pure (Just (BS.take 4 rest0))
                            else do mmore <- recvExactly s need
                                    pure ((rest0 <>) <$> mmore)
@@ -263,3 +280,120 @@ testPostEchoChunked port =
           Nothing   -> assert "POST /echo (chunked) reads full body" False
           Just body -> assert "POST /echo (chunked) echoes body" (okStatus && okLen && body == "ping")
 
+testExpect100ContinueEcho :: Int -> IO Bool
+testExpect100ContinueEcho port =
+  withConn port $ \s -> do
+    -- Send headers only
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 4\r\nConnection: close\r\n\r\n"
+
+    mh1 <- recvHeaders s
+    case mh1 of
+      Nothing -> assert "Expect:100 got interim response" False
+      Just (h1, rest1) -> do
+        let ok100 = statusIs "100 Continue" h1
+        if not ok100
+          then assert "Expect:100 -> 100 Continue" False
+          else do
+            -- Now send body
+            NSB.sendAll s "ping"
+            mh2 <- recvHeadersWith rest1 s
+            case mh2 of
+              Nothing -> assert "Expect:100 got final response" False
+              Just (h2, rest2) -> do
+                let ok200 = statusIs "200 OK" h2 && expectContentLength 4 h2
+                let need = 4 - BS.length rest2
+                mb <- if need <= 0 then pure (Just (BS.take 4 rest2))
+                                   else do mmore <- recvExactly s need
+                                           pure ((rest2 <>) <$> mmore)
+                case mb of
+                  Nothing   -> assert "Expect:100 echo body read" False
+                  Just body -> assert "Expect:100 echo works" (ok200 && body == "ping")
+
+testFramingConflictTECL :: Int -> IO Bool
+testFramingConflictTECL port =
+  withConn port $ \s -> do
+    -- Both TE and CL: must be rejected (smuggling-safe behaviour)
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: close\r\n\r\n" <>
+      "0\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "TE+CL conflict rejected"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+-- ===== New: Filesystem-backed semantics =====
+
+testFsPutGetDeleteCL :: Int -> IO Bool
+testFsPutGetDeleteCL port = do
+  let p = "/fs/spec_test.txt"
+
+  -- Best-effort cleanup: ignore result
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s ("DELETE " <> p <> " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    _ <- recvUntilQuiet s
+    pure ()
+
+  okPut <- withConn port $ \s -> do
+    NSB.sendAll s ("PUT " <> p <> " HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+    out <- recvUntilQuiet s
+    -- accept 201 Created or 204 No Content (depending on your implementation)
+    pure (("HTTP/1.1 201" `BS.isPrefixOf` out) || ("HTTP/1.1 204" `BS.isPrefixOf` out))
+
+  okGet <- withConn port $ \s -> do
+    NSB.sendAll s ("GET " <> p <> " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    mh <- recvHeaders s
+    case mh of
+      Nothing -> pure False
+      Just (hdrs, rest0) -> do
+        let okStatus = statusIs "200 OK" hdrs && expectContentLength 5 hdrs
+            need = 5 - BS.length rest0
+        mb <- if need <= 0 then pure (Just (BS.take 5 rest0))
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
+        pure (okStatus && mb == Just "hello")
+
+  okDel <- withConn port $ \s -> do
+    NSB.sendAll s ("DELETE " <> p <> " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    out <- recvUntilQuiet s
+    pure (("HTTP/1.1 204" `BS.isPrefixOf` out) || ("HTTP/1.1 200" `BS.isPrefixOf` out))
+
+  ok404 <- withConn port $ \s -> do
+    NSB.sendAll s ("GET " <> p <> " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    out <- recvUntilQuiet s
+    pure ("HTTP/1.1 404" `BS.isPrefixOf` out)
+
+  assert "FS PUT/GET/DELETE (CL)" (okPut && okGet && okDel && ok404)
+
+testFsPutChunked :: Int -> IO Bool
+testFsPutChunked port = do
+  let p = "/fs/spec_chunked.txt"
+
+  okPut <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" <>
+      "5\r\nhello\r\n0\r\n\r\n"
+    out <- recvUntilQuiet s
+    pure (("HTTP/1.1 201" `BS.isPrefixOf` out) || ("HTTP/1.1 204" `BS.isPrefixOf` out))
+
+  okGet <- withConn port $ \s -> do
+    NSB.sendAll s ("GET " <> p <> " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    mh <- recvHeaders s
+    case mh of
+      Nothing -> pure False
+      Just (hdrs, rest0) -> do
+        let okStatus = statusIs "200 OK" hdrs && expectContentLength 5 hdrs
+            need = 5 - BS.length rest0
+        mb <- if need <= 0 then pure (Just (BS.take 5 rest0))
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
+        pure (okStatus && mb == Just "hello")
+
+  assert "FS PUT (chunked) then GET" (okPut && okGet)
+
+testFsPathTraversalRejected :: Int -> IO Bool
+testFsPathTraversalRejected port =
+  withConn port $ \s -> do
+    -- Attempt to escape fs_root; must not succeed (should not be 200 OK).
+    NSB.sendAll s "GET /fs/../bench_files/json1k.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "FS path traversal rejected" (not ("HTTP/1.1 200" `BS.isPrefixOf` out))

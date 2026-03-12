@@ -16,6 +16,7 @@ import qualified Network.Socket.ByteString as NSB
 import System.FilePath ((</>), takeDirectory)
 import qualified System.Directory as Dir
 import Control.Exception (try)
+import Control.Monad (when)
 
 import Http.Types
 import Http.Parse
@@ -115,6 +116,19 @@ handleConn bench sock = loop BS.empty
                       path0 = stripQuery (normalisedPath (rhTarget headReq))
                       inp0  = Input rest (NSB.recv sock)
 
+                  -- Expect: 100-continue (only when we will actually read a body)
+                  let expect100 = hasExpect100 (rhHeaders headReq)
+                      willReadBody =
+                        framing /= NoBody &&
+                        ( path0 == "/echo"
+                          || case rhMethod headReq of
+                               PUT    -> fsRelPath path0 /= Nothing
+                               POST   -> fsRelPath path0 /= Nothing
+                               _      -> False
+                        )
+
+                  when (expect100 && willReadBody) $
+                    NSB.sendAll sock "HTTP/1.1 100 Continue\r\n\r\n"
                   -- Dispatch (may read/drain body)
                   (inp1, finalPref, resp) <- dispatch bench headReq path0 framing pref inp0
                   sendBuilder sock resp
@@ -157,6 +171,18 @@ dispatch bench headReq path framing pref inp0 =
                             pure (inp1, pref, responseFor ok ctText "healthy\n" True pref [])
     (HEAD, "/health") -> do inp1 <- drainIf framing inp0
                             pure (inp1, pref, responseFor ok ctText "healthy\n" False pref [])
+    -- ===== echo (for body/framing correctness) =====
+    (POST, "/echo") -> do
+      case framing of
+        NoBody ->
+          pure (inp0, Close, responseFor lengthRequired ctText "Length Required\n" True Close [])
+        _ -> do
+          eb <- readBodyStrict framing inp0
+          case eb of
+            Left _ ->
+              pure (inp0, Close, responseFor payloadTooLarge ctText "Payload Too Large\n" True Close [])
+            Right (body, inp1) ->
+              pure (inp1, pref, responseFor ok ctBin body True pref [])
 
     -- ===== filesystem-backed resource routes =====
     (GET, p) | Just rel <- fsRelPath p -> do
