@@ -2,3 +2,5 @@
 * text=auto
 *.hs linguist-detectable
 *.hs linguist-language=Haskell
+.venv/* linguist-vendored
+
