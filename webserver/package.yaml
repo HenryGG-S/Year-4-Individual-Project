@@ -31,6 +31,7 @@ dependencies:
   - text
   - directory
   - filepath
+  - time
 
 ghc-options:
 - -Wall

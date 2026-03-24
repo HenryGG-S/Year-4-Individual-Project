@@ -4,6 +4,8 @@ module Http.Types
   , RequestHead(..)
   , Header
   , headerLookup
+  , headerLookupAll
+  , headerCount
   , ConnectionPref(..)
   ) where
 
@@ -19,7 +21,7 @@ type Header = (CI.CI BS.ByteString, BS.ByteString)
 
 data RequestHead = RequestHead
   { rhMethod  :: !Method
-  , rhTarget  :: !BS.ByteString  -- raw request-target (we’ll normalise in routing)
+  , rhTarget  :: !BS.ByteString
   , rhVersion :: !BS.ByteString
   , rhHeaders :: ![Header]
   } deriving (Show)
@@ -27,4 +29,14 @@ data RequestHead = RequestHead
 data ConnectionPref = KeepAlive | Close deriving (Eq, Show)
 
 headerLookup :: BS.ByteString -> [Header] -> Maybe BS.ByteString
-headerLookup name hs = lookup (CI.mk name) hs
+headerLookup name hs =
+  case headerLookupAll name hs of
+    []    -> Nothing
+    v : _ -> Just v
+
+headerLookupAll :: BS.ByteString -> [Header] -> [BS.ByteString]
+headerLookupAll name =
+  map snd . filter (\(k, _) -> k == CI.mk name)
+
+headerCount :: BS.ByteString -> [Header] -> Int
+headerCount name = length . headerLookupAll name

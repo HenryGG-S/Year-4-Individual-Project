@@ -40,9 +40,55 @@ runAll port = and <$> sequence
   , testFsPutGetDeleteCL port
   , testFsPutChunked port
   , testFsPathTraversalRejected port
+  , testDuplicateHost400 port
+  , testInvalidHost400 port
+  , testUnknownPath404 port
+  , testKnownPathWrongMethod405 port
+  , testDelete204NoContentLength port
+  , testInvalidContentLengthRejected port
+  , testMismatchedDuplicateContentLengthRejected port
+  , testShortBodyRejected port
+  , testMalformedChunkedRejected port
+  , testHttp10ExpectIgnored port
+  , testAbsoluteFormHealth port
+  , testAbsoluteFormRoot port
+  , testAuthorityFormNonConnect400 port
+  , testConnectAuthorityNotImplemented port
+  , testHostWithPortAccepted port
+  , testBracketedIPv6HostAccepted port
+  , testFsGetIncludesLastModified port
+  , testFsIfModifiedSinceReturns304 port
+  , testFsHeadIfModifiedSinceReturns304 port
+  , testFsPutIfUnmodifiedSinceFails port
+  , testFsPutIfUnmodifiedSinceSucceeds port
+  , testFsDeleteIfUnmodifiedSinceFails port
+  , testFsDeleteIfUnmodifiedSinceSucceeds port
+  , testFsGetIncludesEtag port
+  , testFsIfNoneMatchReturns304 port
+  , testFsPutIfMatchFails port
+  , testFsPutIfMatchSucceeds port
+  , testFsDeleteIfMatchFails port
+  , testFsDeleteIfMatchSucceeds port
   ]
 
 -- ===== Helpers =====
+headerValue :: BS.ByteString -> BS.ByteString -> Maybe BS.ByteString
+headerValue name hdrs =
+  let prefix = name <> ": "
+      ls = map stripCR (B8.lines hdrs)
+      stripCR = BS.takeWhile (/= 13)
+  in case [BS.drop (BS.length prefix) l | l <- ls, prefix `BS.isPrefixOf` l] of
+       v:_ -> Just v
+       []  -> Nothing
+
+hasHeader :: BS.ByteString -> BS.ByteString -> Bool
+hasHeader name hdrs =
+  (name <> ": ") `BS.isInfixOf` hdrs
+
+bodyAfterHeaders :: BS.ByteString -> BS.ByteString
+bodyAfterHeaders out =
+  let (_pre, rest) = B8.breakSubstring "\r\n\r\n" out
+  in BS.drop 4 rest
 
 assert :: String -> Bool -> IO Bool
 assert name cond =
@@ -397,3 +443,718 @@ testFsPathTraversalRejected port =
     NSB.sendAll s "GET /fs/../bench_files/json1k.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     out <- recvUntilQuiet s
     assert "FS path traversal rejected" (not ("HTTP/1.1 200" `BS.isPrefixOf` out))
+
+testDuplicateHost400 :: Int -> IO Bool
+testDuplicateHost400 port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET / HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Host: example.com\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "duplicate Host -> 400"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+testInvalidHost400 :: Int -> IO Bool
+testInvalidHost400 port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET / HTTP/1.1\r\n" <>
+      "Host: bad host\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "invalid Host -> 400"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+testUnknownPath404 :: Int -> IO Bool
+testUnknownPath404 port =
+  withConn port $ \s -> do
+    NSB.sendAll s "GET /definitely-missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "unknown path GET -> 404"
+      ("HTTP/1.1 404" `BS.isPrefixOf` out)
+
+testKnownPathWrongMethod405 :: Int -> IO Bool
+testKnownPathWrongMethod405 port =
+  withConn port $ \s -> do
+    NSB.sendAll s "POST /json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "known path wrong method -> 405 with Allow"
+      (("HTTP/1.1 405" `BS.isPrefixOf` out) &&
+       ("Allow: GET, HEAD\r\n" `BS.isInfixOf` out))
+
+testDelete204NoContentLength :: Int -> IO Bool
+testDelete204NoContentLength port = do
+  let p = "/fs/spec_204.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 4\r\n" <>
+      "Connection: close\r\n\r\ntest"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "DELETE " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    let after = bodyAfterHeaders out
+    assert "204 has no Content-Length and no body"
+      (("HTTP/1.1 204 No Content" `BS.isPrefixOf` out) &&
+       not (hasHeader "Content-Length" out) &&
+       BS.null after)
+
+testInvalidContentLengthRejected :: Int -> IO Bool
+testInvalidContentLengthRejected port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5abc\r\n" <>
+      "Connection: close\r\n\r\n" <>
+      "ping!"
+    out <- recvUntilQuiet s
+    assert "invalid Content-Length rejected"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+testMismatchedDuplicateContentLengthRejected :: Int -> IO Bool
+testMismatchedDuplicateContentLengthRejected port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 4\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\n" <>
+      "ping!"
+    out <- recvUntilQuiet s
+    assert "mismatched duplicate Content-Length rejected"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+testShortBodyRejected :: Int -> IO Bool
+testShortBodyRejected port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\n" <>
+      "ping"
+    NS.shutdown s NS.ShutdownSend
+    out <- recvUntilQuiet s
+    assert "short fixed-length body rejected"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+testMalformedChunkedRejected :: Int -> IO Bool
+testMalformedChunkedRejected port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Transfer-Encoding: chunked\r\n" <>
+      "Connection: close\r\n\r\n" <>
+      "4\r\nping\r\nX\r\n"
+    out <- recvUntilQuiet s
+    assert "malformed chunked body rejected"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+testHttp10ExpectIgnored :: Int -> IO Bool
+testHttp10ExpectIgnored port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "POST /echo HTTP/1.0\r\n" <>
+      "Host: localhost\r\n" <>
+      "Expect: 100-continue\r\n" <>
+      "Content-Length: 4\r\n" <>
+      "Connection: close\r\n\r\n"
+
+    m <- timeout 200000 (NSB.recv s 256)
+    let noInterim100 =
+          case m of
+            Nothing -> True
+            Just bs -> not ("100 Continue" `BS.isInfixOf` bs)
+
+    if not noInterim100
+      then assert "HTTP/1.0 Expect ignored" False
+      else do
+        NSB.sendAll s "ping"
+        out <- recvUntilQuiet s
+        assert "HTTP/1.0 Expect ignored and final response still works"
+          (not ("100 Continue" `BS.isInfixOf` out) &&
+           ("200 OK" `BS.isInfixOf` out) &&
+           ("ping" `BS.isInfixOf` out))
+
+testAbsoluteFormHealth :: Int -> IO Bool
+testAbsoluteFormHealth port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET http://localhost/health HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "absolute-form GET /health works"
+      ("HTTP/1.1 200 OK" `BS.isPrefixOf` out && "healthy\n" `BS.isInfixOf` out)
+
+testAbsoluteFormRoot :: Int -> IO Bool
+testAbsoluteFormRoot port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET http://localhost HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "absolute-form GET with path-empty maps to /"
+      ("HTTP/1.1 200 OK" `BS.isPrefixOf` out && "ok\n" `BS.isInfixOf` out)
+
+testAuthorityFormNonConnect400 :: Int -> IO Bool
+testAuthorityFormNonConnect400 port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET localhost:8080 HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "authority-form non-CONNECT -> 400"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+testConnectAuthorityNotImplemented :: Int -> IO Bool
+testConnectAuthorityNotImplemented port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "CONNECT localhost:443 HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "CONNECT authority-form -> 501"
+      ("HTTP/1.1 501" `BS.isPrefixOf` out)
+
+testHostWithPortAccepted :: Int -> IO Bool
+testHostWithPortAccepted port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET / HTTP/1.1\r\n" <>
+      "Host: localhost:8080\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "Host with explicit port accepted"
+      ("HTTP/1.1 200 OK" `BS.isPrefixOf` out)
+
+testBracketedIPv6HostAccepted :: Int -> IO Bool
+testBracketedIPv6HostAccepted port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET / HTTP/1.1\r\n" <>
+      "Host: [::1]:8080\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "bracketed IPv6 Host accepted"
+      ("HTTP/1.1 200 OK" `BS.isPrefixOf` out)
+
+testFsGetIncludesLastModified :: Int -> IO Bool
+testFsGetIncludesLastModified port = do
+  let p = "/fs/spec_cache.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    case mh of
+      Nothing -> assert "GET /fs includes Last-Modified headers received" False
+      Just (hdrs, rest0) -> do
+        let okStatus = statusIs "200 OK" hdrs
+            hasLM    = hasHeader "Last-Modified" hdrs
+            need     = 5 - BS.length rest0
+        mb <- if need <= 0 then pure (Just (BS.take 5 rest0))
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
+        case mb of
+          Nothing   -> assert "GET /fs includes Last-Modified full body" False
+          Just body -> assert "GET /fs includes Last-Modified"
+            (okStatus && hasLM && body == "hello")
+
+testFsIfModifiedSinceReturns304 :: Int -> IO Bool
+testFsIfModifiedSinceReturns304 port = do
+  let p = "/fs/spec_cache_304.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  mLastMod <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    pure $ case mh of
+      Nothing        -> Nothing
+      Just (hdrs, _) -> headerValue "Last-Modified" hdrs
+
+  case mLastMod of
+    Nothing -> assert "GET /fs produced Last-Modified for conditional GET" False
+    Just lm ->
+      withConn port $ \s -> do
+        NSB.sendAll s $
+          "GET " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "If-Modified-Since: " <> lm <> "\r\n" <>
+          "Connection: close\r\n\r\n"
+        out <- recvUntilQuiet s
+        let after = bodyAfterHeaders out
+        assert "If-Modified-Since -> 304"
+          (("HTTP/1.1 304 Not Modified" `BS.isPrefixOf` out) &&
+           hasHeader "Last-Modified" out &&
+           BS.null after)
+
+testFsHeadIfModifiedSinceReturns304 :: Int -> IO Bool
+testFsHeadIfModifiedSinceReturns304 port = do
+  let p = "/fs/spec_cache_head_304.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  mLastMod <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    pure $ case mh of
+      Nothing        -> Nothing
+      Just (hdrs, _) -> headerValue "Last-Modified" hdrs
+
+  case mLastMod of
+    Nothing -> assert "HEAD /fs conditional produced Last-Modified source value" False
+    Just lm ->
+      withConn port $ \s -> do
+        NSB.sendAll s $
+          "HEAD " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "If-Modified-Since: " <> lm <> "\r\n" <>
+          "Connection: close\r\n\r\n"
+        out <- recvUntilQuiet s
+        let after = bodyAfterHeaders out
+        assert "HEAD with If-Modified-Since -> 304 no body"
+          (("HTTP/1.1 304 Not Modified" `BS.isPrefixOf` out) &&
+           hasHeader "Last-Modified" out &&
+           BS.null after)
+
+testFsPutIfUnmodifiedSinceFails :: Int -> IO Bool
+testFsPutIfUnmodifiedSinceFails port = do
+  let p = "/fs/spec_put_precond_fail.txt"
+      oldDate = "Wed, 01 Jan 2020 00:00:00 GMT"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  out <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "If-Unmodified-Since: " <> oldDate <> "\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nworld"
+    recvUntilQuiet s
+
+  bodyOk <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out2 <- recvUntilQuiet s
+    pure ("hello" `BS.isInfixOf` out2 && not ("world" `BS.isInfixOf` out2))
+
+  assert "PUT If-Unmodified-Since failure -> 412 and no overwrite"
+    (("HTTP/1.1 412 Precondition Failed" `BS.isPrefixOf` out) &&
+     hasHeader "Last-Modified" out &&
+     bodyOk)
+
+testFsPutIfUnmodifiedSinceSucceeds :: Int -> IO Bool
+testFsPutIfUnmodifiedSinceSucceeds port = do
+  let p = "/fs/spec_put_precond_ok.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  mLastMod <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    pure $ case mh of
+      Nothing        -> Nothing
+      Just (hdrs, _) -> headerValue "Last-Modified" hdrs
+
+  case mLastMod of
+    Nothing -> assert "PUT precondition success source Last-Modified available" False
+    Just lm -> do
+      out <- withConn port $ \s -> do
+        NSB.sendAll s $
+          "PUT " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "If-Unmodified-Since: " <> lm <> "\r\n" <>
+          "Content-Length: 5\r\n" <>
+          "Connection: close\r\n\r\nworld"
+        recvUntilQuiet s
+
+      bodyOk <- withConn port $ \s -> do
+        NSB.sendAll s $
+          "GET " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "Connection: close\r\n\r\n"
+        out2 <- recvUntilQuiet s
+        pure ("world" `BS.isInfixOf` out2)
+
+      assert "PUT If-Unmodified-Since success updates resource"
+        (("HTTP/1.1 204 No Content" `BS.isPrefixOf` out) && bodyOk)
+
+testFsDeleteIfUnmodifiedSinceFails :: Int -> IO Bool
+testFsDeleteIfUnmodifiedSinceFails port = do
+  let p = "/fs/spec_delete_precond_fail.txt"
+      oldDate = "Wed, 01 Jan 2020 00:00:00 GMT"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  out <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "DELETE " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "If-Unmodified-Since: " <> oldDate <> "\r\n" <>
+      "Connection: close\r\n\r\n"
+    recvUntilQuiet s
+
+  stillThere <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out2 <- recvUntilQuiet s
+    pure ("HTTP/1.1 200 OK" `BS.isPrefixOf` out2 && "hello" `BS.isInfixOf` out2)
+
+  assert "DELETE If-Unmodified-Since failure -> 412 and file remains"
+    (("HTTP/1.1 412 Precondition Failed" `BS.isPrefixOf` out) &&
+     hasHeader "Last-Modified" out &&
+     stillThere)
+
+testFsDeleteIfUnmodifiedSinceSucceeds :: Int -> IO Bool
+testFsDeleteIfUnmodifiedSinceSucceeds port = do
+  let p = "/fs/spec_delete_precond_ok.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  mLastMod <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    pure $ case mh of
+      Nothing        -> Nothing
+      Just (hdrs, _) -> headerValue "Last-Modified" hdrs
+
+  case mLastMod of
+    Nothing -> assert "DELETE precondition success source Last-Modified available" False
+    Just lm -> do
+      out <- withConn port $ \s -> do
+        NSB.sendAll s $
+          "DELETE " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "If-Unmodified-Since: " <> lm <> "\r\n" <>
+          "Connection: close\r\n\r\n"
+        recvUntilQuiet s
+
+      gone <- withConn port $ \s -> do
+        NSB.sendAll s $
+          "GET " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "Connection: close\r\n\r\n"
+        out2 <- recvUntilQuiet s
+        pure ("HTTP/1.1 404 Not Found" `BS.isPrefixOf` out2)
+
+      assert "DELETE If-Unmodified-Since success removes resource"
+        (("HTTP/1.1 204 No Content" `BS.isPrefixOf` out) && gone)
+
+testFsGetIncludesEtag :: Int -> IO Bool
+testFsGetIncludesEtag port = do
+  let p = "/fs/spec_etag.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    case mh of
+      Nothing -> assert "GET /fs includes ETag headers received" False
+      Just (hdrs, rest0) -> do
+        let okStatus = statusIs "200 OK" hdrs
+            hasETag  = hasHeader "ETag" hdrs
+            need     = 5 - BS.length rest0
+        mb <- if need <= 0 then pure (Just (BS.take 5 rest0))
+                           else do mmore <- recvExactly s need
+                                   pure ((rest0 <>) <$> mmore)
+        case mb of
+          Nothing   -> assert "GET /fs includes ETag full body" False
+          Just body -> assert "GET /fs includes ETag"
+            (okStatus && hasETag && body == "hello")
+
+testFsIfNoneMatchReturns304 :: Int -> IO Bool
+testFsIfNoneMatchReturns304 port = do
+  let p = "/fs/spec_etag_304.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  mETag <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    pure $ case mh of
+      Nothing        -> Nothing
+      Just (hdrs, _) -> headerValue "ETag" hdrs
+
+  case mETag of
+    Nothing -> assert "GET /fs produced ETag for conditional GET" False
+    Just et -> withConn port $ \s -> do
+      NSB.sendAll s $
+        "GET " <> p <> " HTTP/1.1\r\n" <>
+        "Host: localhost\r\n" <>
+        "If-None-Match: " <> et <> "\r\n" <>
+        "Connection: close\r\n\r\n"
+      out <- recvUntilQuiet s
+      let after = bodyAfterHeaders out
+      assert "If-None-Match -> 304"
+        (("HTTP/1.1 304 Not Modified" `BS.isPrefixOf` out) &&
+         hasHeader "ETag" out &&
+         BS.null after)
+
+testFsPutIfMatchFails :: Int -> IO Bool
+testFsPutIfMatchFails port = do
+  let p = "/fs/spec_ifmatch_put_fail.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  out <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "If-Match: \"definitely-wrong\"\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nworld"
+    recvUntilQuiet s
+
+  bodyOk <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out2 <- recvUntilQuiet s
+    pure ("hello" `BS.isInfixOf` out2 && not ("world" `BS.isInfixOf` out2))
+
+  assert "PUT If-Match failure -> 412 and no overwrite"
+    (("HTTP/1.1 412 Precondition Failed" `BS.isPrefixOf` out) &&
+     hasHeader "ETag" out &&
+     bodyOk)
+
+testFsPutIfMatchSucceeds :: Int -> IO Bool
+testFsPutIfMatchSucceeds port = do
+  let p = "/fs/spec_ifmatch_put_ok.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  mETag <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    pure $ case mh of
+      Nothing        -> Nothing
+      Just (hdrs, _) -> headerValue "ETag" hdrs
+
+  case mETag of
+    Nothing -> assert "PUT If-Match success source ETag available" False
+    Just et -> do
+      out <- withConn port $ \s -> do
+        NSB.sendAll s $
+          "PUT " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "If-Match: " <> et <> "\r\n" <>
+          "Content-Length: 5\r\n" <>
+          "Connection: close\r\n\r\nworld"
+        recvUntilQuiet s
+
+      bodyOk <- withConn port $ \s -> do
+        NSB.sendAll s $
+          "GET " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "Connection: close\r\n\r\n"
+        out2 <- recvUntilQuiet s
+        pure ("world" `BS.isInfixOf` out2)
+
+      assert "PUT If-Match success updates resource"
+        (("HTTP/1.1 204 No Content" `BS.isPrefixOf` out) && bodyOk)
+
+testFsDeleteIfMatchFails :: Int -> IO Bool
+testFsDeleteIfMatchFails port = do
+  let p = "/fs/spec_ifmatch_delete_fail.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  out <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "DELETE " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "If-Match: \"definitely-wrong\"\r\n" <>
+      "Connection: close\r\n\r\n"
+    recvUntilQuiet s
+
+  stillThere <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    out2 <- recvUntilQuiet s
+    pure ("HTTP/1.1 200 OK" `BS.isPrefixOf` out2 && "hello" `BS.isInfixOf` out2)
+
+  assert "DELETE If-Match failure -> 412 and file remains"
+    (("HTTP/1.1 412 Precondition Failed" `BS.isPrefixOf` out) &&
+     hasHeader "ETag" out &&
+     stillThere)
+
+testFsDeleteIfMatchSucceeds :: Int -> IO Bool
+testFsDeleteIfMatchSucceeds port = do
+  let p = "/fs/spec_ifmatch_delete_ok.txt"
+
+  _ <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: 5\r\n" <>
+      "Connection: close\r\n\r\nhello"
+    _ <- recvUntilQuiet s
+    pure ()
+
+  mETag <- withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    pure $ case mh of
+      Nothing        -> Nothing
+      Just (hdrs, _) -> headerValue "ETag" hdrs
+
+  case mETag of
+    Nothing -> assert "DELETE If-Match success source ETag available" False
+    Just et -> do
+      out <- withConn port $ \s -> do
+        NSB.sendAll s $
+          "DELETE " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "If-Match: " <> et <> "\r\n" <>
+          "Connection: close\r\n\r\n"
+        recvUntilQuiet s
+
+      gone <- withConn port $ \s -> do
+        NSB.sendAll s $
+          "GET " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "Connection: close\r\n\r\n"
+        out2 <- recvUntilQuiet s
+        pure ("HTTP/1.1 404 Not Found" `BS.isPrefixOf` out2)
+
+      assert "DELETE If-Match success removes resource"
+        (("HTTP/1.1 204 No Content" `BS.isPrefixOf` out) && gone)

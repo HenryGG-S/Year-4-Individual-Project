@@ -7,9 +7,9 @@ module Http.Framing
   ) where
 
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Char8 as B8
 import qualified Data.CaseInsensitive as CI
-import Http.Types (Header, headerLookup)
+import Data.Word (Word8)
+import Http.Types (Header, headerLookupAll)
 
 data BodyFraming
   = NoBody
@@ -18,64 +18,104 @@ data BodyFraming
   deriving (Eq, Show)
 
 data FramingError
-  = ConflictingLength   -- TE and CL both present
+  = ConflictingLength
   | InvalidContentLength
   | UnsupportedTransferEncoding
   deriving (Eq, Show)
 
--- RFC-ish rules (pragmatic + safe):
--- - If TE and CL both present => reject (smuggling risk)
--- - If TE present => must end in "chunked" => Chunked, else reject
--- - Else if CL present => parse (allow "0" or comma-list with same value)
--- - Else => NoBody
 decideBodyFraming :: [Header] -> Either FramingError BodyFraming
 decideBodyFraming hs =
-  case (teHeader, clHeader) of
-    (Just _, Just _) -> Left ConflictingLength
-    (Just te, Nothing) ->
-      if teEndsInChunked te then Right Chunked else Left UnsupportedTransferEncoding
-    (Nothing, Just cl) ->
-      case parseContentLength cl of
-        Just n | n >= 0    -> Right (if n == 0 then NoBody else ContentLength n)
-        _                  -> Left InvalidContentLength
-    (Nothing, Nothing) -> Right NoBody
+  case (teHeaders, clHeaders) of
+    (_:_, _:_) -> Left ConflictingLength
+    (_:_, [])  ->
+      case parseTransferCodings teHeaders of
+        Just codings
+          | validChunkedTransferCoding codings -> Right Chunked
+          | otherwise                          -> Left UnsupportedTransferEncoding
+        Nothing -> Left UnsupportedTransferEncoding
+    ([], _:_)  ->
+      case parseContentLengths clHeaders of
+        Just 0 -> Right NoBody
+        Just n -> Right (ContentLength n)
+        Nothing -> Left InvalidContentLength
+    ([], [])   -> Right NoBody
   where
-    teHeader = headerLookup "Transfer-Encoding" hs
-    clHeader = headerLookup "Content-Length" hs
+    teHeaders = headerLookupAll "Transfer-Encoding" hs
+    clHeaders = headerLookupAll "Content-Length" hs
 
 hasExpect100 :: [Header] -> Bool
 hasExpect100 hs =
-  case headerLookup "Expect" hs of
-    Nothing -> False
-    Just v  ->
-      let toks = map (CI.mk . trimOWS) (BS.split 44 v) -- comma
-      in CI.mk "100-continue" `elem` toks
-
--- Transfer-Encoding is a list of codings; chunked must be final coding.
-teEndsInChunked :: BS.ByteString -> Bool
-teEndsInChunked raw =
-  let parts = map (CI.mk . trimOWS) (BS.split 44 raw)
-  in not (null parts) && last parts == CI.mk "chunked"
-
-parseContentLength :: BS.ByteString -> Maybe Int
-parseContentLength raw =
-  case map trimOWS (BS.split 44 raw) of
-    [] -> Nothing
-    xs ->
-      let ms = map parseInt xs
-      in case ms of
-           [] -> Nothing
-           (Just n : rest) | all (== Just n) rest -> Just n
-           _                                      -> Nothing
+  CI.mk "100-continue" `elem` tokens
   where
-    parseInt bs = case B8.readInt (B8.pack (B8.unpack bs)) of
-      Just (n, _) -> Just n
-      Nothing     -> Nothing
+    tokens =
+      [ CI.mk tok
+      | raw <- headerLookupAll "Expect" hs
+      , tok <- BS.split 44 raw
+      , let t = trimOWS tok
+      , not (BS.null t)
+      ]
+
+validChunkedTransferCoding :: [BS.ByteString] -> Bool
+validChunkedTransferCoding toks =
+  not (null toks)
+    && last cis == CI.mk "chunked"
+    && length (filter (== CI.mk "chunked") cis) == 1
+  where
+    cis = map CI.mk toks
+
+parseTransferCodings :: [BS.ByteString] -> Maybe [BS.ByteString]
+parseTransferCodings raws = do
+  groups <- traverse splitCommaTokensStrict raws
+  let toks = concat groups
+  if null toks then Nothing else Just toks
+
+parseContentLengths :: [BS.ByteString] -> Maybe Int
+parseContentLengths raws = do
+  groups <- traverse splitCommaTokensStrict raws
+  let toks = concat groups
+  if null toks
+    then Nothing
+    else do
+      ns <- traverse parseStrictContentLength toks
+      case ns of
+        []     -> Nothing
+        n : ns'
+          | all (== n) ns' -> Just n
+          | otherwise      -> Nothing
+
+parseStrictContentLength :: BS.ByteString -> Maybe Int
+parseStrictContentLength raw = do
+  let bs = trimOWS raw
+  if BS.null bs || BS.any (not . isDigitWord8) bs
+    then Nothing
+    else decimalToInt bs
+
+splitCommaTokensStrict :: BS.ByteString -> Maybe [BS.ByteString]
+splitCommaTokensStrict raw =
+  let toks = map trimOWS (BS.split 44 raw)
+  in if null toks || any BS.null toks
+       then Nothing
+       else Just toks
 
 trimOWS :: BS.ByteString -> BS.ByteString
-trimOWS =
-  dropStart . dropEnd
+trimOWS = dropStart . dropEnd
   where
     isOWS c = c == 32 || c == 9
     dropStart = BS.dropWhile isOWS
     dropEnd b = BS.reverse (BS.dropWhile isOWS (BS.reverse b))
+
+isDigitWord8 :: Word8 -> Bool
+isDigitWord8 w = w >= 48 && w <= 57
+
+decimalToInt :: BS.ByteString -> Maybe Int
+decimalToInt bs = fmap fromInteger (go 0 (BS.unpack bs))
+  where
+    maxI = toInteger (maxBound :: Int)
+
+    go acc [] = Just acc
+    go acc (w:ws)
+      | not (isDigitWord8 w) = Nothing
+      | otherwise =
+          let digit = toInteger (fromIntegral w - 48 :: Int)
+              acc'  = acc * 10 + digit
+          in if acc' > maxI then Nothing else go acc' ws
