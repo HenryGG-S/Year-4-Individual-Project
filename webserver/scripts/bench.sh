@@ -7,48 +7,52 @@ DURATION="60"     # seconds
 THREADS="2"
 CONNS="100"
 NAME=""
+RUN_INDEX=""
+RAW_CSV=""
 
 usage() {
-  echo "Usage: $0 --url URL --rate RPS [--duration S] [--threads N] [--conns N] [--name NAME]"
+  echo "Usage: $0 --url URL --rate RPS [--duration S] [--threads N] [--conns N] [--name NAME] [--run-index N] [--raw-csv PATH]"
   exit 1
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --url) URL="$2"; shift 2;;
-    --rate) RATE="$2"; shift 2;;
-    --duration) DURATION="$2"; shift 2;;
-    --threads) THREADS="$2"; shift 2;;
-    --conns) CONNS="$2"; shift 2;;
-    --name) NAME="$2"; shift 2;;
-    *) usage;;
+    --url) URL="$2"; shift 2 ;;
+    --rate) RATE="$2"; shift 2 ;;
+    --duration) DURATION="$2"; shift 2 ;;
+    --threads) THREADS="$2"; shift 2 ;;
+    --conns) CONNS="$2"; shift 2 ;;
+    --name) NAME="$2"; shift 2 ;;
+    --run-index) RUN_INDEX="$2"; shift 2 ;;
+    --raw-csv) RAW_CSV="$2"; shift 2 ;;
+    *) usage ;;
   esac
 done
 
 [[ -z "$URL" || -z "$RATE" ]] && usage
 [[ -z "$NAME" ]] && NAME="$(echo "$URL" | sed 's#http://##; s#https://##; s#[/:]#_#g')"
 
-# Detect wrk2 command name:
-WRK=""
-if command -v wrk2 >/dev/null 2>&1; then
-  WRK="wrk2"
-elif command -v wrk >/dev/null 2>&1; then
-  WRK="wrk"
-else
-  echo "Error: neither 'wrk2' nor 'wrk' found in PATH."
+if ! command -v wrk2 >/dev/null 2>&1; then
+  echo "Error: 'wrk2' not found in PATH. This script requires wrk2 because it uses fixed-rate mode (-R)." >&2
   exit 2
 fi
+WRK="wrk2"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNS_DIR="$ROOT/bench/runs"
 TS="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="$RUNS_DIR/${TS}_${NAME}_R${RATE}_c${CONNS}_t${THREADS}_d${DURATION}s"
+OUT_DIR="$RUNS_DIR/${TS}_${NAME}_R${RATE}_c${CONNS}_t${THREADS}_d${DURATION}s${RUN_INDEX:+_run${RUN_INDEX}}"
 mkdir -p "$OUT_DIR"
 
-# Metadata
+if [[ -z "$RAW_CSV" ]]; then
+  RAW_CSV="$ROOT/bench/raw_runs.csv"
+fi
+mkdir -p "$(dirname "$RAW_CSV")"
+
 {
   echo "timestamp=$TS"
   echo "name=$NAME"
+  echo "run_index=$RUN_INDEX"
   echo "url=$URL"
   echo "rate_rps=$RATE"
   echo "duration_s=$DURATION"
@@ -63,7 +67,6 @@ mkdir -p "$OUT_DIR"
   echo "wrk_version=$($WRK --version 2>/dev/null || true)"
 } > "$OUT_DIR/meta.txt"
 
-# Run
 set +e
 "$WRK" -t"$THREADS" -c"$CONNS" -d"${DURATION}s" -R"$RATE" \
   --latency \
@@ -74,26 +77,21 @@ set -e
 
 echo "$RC" > "$OUT_DIR/exit_code.txt"
 
-# Extract metrics block
 awk '
   /--- metrics ---/ {inblk=1; next}
   /--- end ---/ {inblk=0}
   inblk==1 {print}
 ' "$OUT_DIR/wrk2.out" > "$OUT_DIR/metrics.txt" || true
 
-# Build CSV row
 # shellcheck disable=SC1090
 source <(sed 's/^/export /' "$OUT_DIR/metrics.txt" 2>/dev/null || true)
 
-CSV="$ROOT/bench/summary.csv"
-mkdir -p "$ROOT/bench"
-if [[ ! -f "$CSV" ]]; then
-  echo "timestamp,name,url,rate_rps,duration_s,threads,connections,requests,achieved_rps,p50_ms,p95_ms,p99_ms,p999_ms,err_connect,err_read,err_write,err_status,err_timeout,exit_code" > "$CSV"
+if [[ ! -f "$RAW_CSV" ]]; then
+  echo "timestamp,name,run_index,url,rate_rps,duration_s,threads,connections,requests,achieved_rps,p50_ms,p95_ms,p99_ms,p999_ms,err_connect,err_read,err_write,err_status,err_timeout,exit_code,run_dir" > "$RAW_CSV"
 fi
 
-echo "${TS},${NAME},${URL},${RATE},${DURATION},${THREADS},${CONNS},${requests:-},${rps:-},${p50_ms:-},${p95_ms:-},${p99_ms:-},${p999_ms:-},${err_connect:-},${err_read:-},${err_write:-},${err_status:-},${err_timeout:-},${RC}" >> "$CSV"
+echo "${TS},${NAME},${RUN_INDEX},${URL},${RATE},${DURATION},${THREADS},${CONNS},${requests:-},${rps:-},${p50_ms:-},${p95_ms:-},${p99_ms:-},${p999_ms:-},${err_connect:-},${err_read:-},${err_write:-},${err_status:-},${err_timeout:-},${RC},${OUT_DIR}" >> "$RAW_CSV"
 
 echo "Run saved to: $OUT_DIR"
-echo "Summary appended to: $CSV"
+echo "Raw results appended to: $RAW_CSV"
 exit "$RC"
-
