@@ -6,29 +6,31 @@ module Server
 
 import Control.Concurrent (forkFinally)
 import Control.Exception (IOException, bracket, catch, try)
+import Control.Monad (when)
 import qualified Data.Attoparsec.ByteString as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.CaseInsensitive as CI
-import qualified Network.Socket as NS
-import qualified Network.Socket.ByteString as NSB
-import System.FilePath ((</>), takeDirectory)
-import qualified System.Directory as Dir
-import Control.Monad (when)
+import Data.Char (toLower)
+import Data.Maybe (mapMaybe)
 import Data.Time.Clock (UTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+import qualified Network.Socket as NS
+import qualified Network.Socket.ByteString as NSB
+import Numeric (showHex)
+import System.FilePath ((</>), takeDirectory, takeExtension)
+import qualified System.Directory as Dir
 import System.Timeout (timeout)
 
-import Http.Types
+import Http.Body
+import Http.Framing
 import Http.Parse
 import Http.Response
-import Http.Framing
-import Http.Body
+import Http.Types
 import Workloads (BenchPayloads(..), loadBenchPayloads)
-import Numeric (showHex)
 
 -- ===== Public API =====
 
@@ -97,6 +99,25 @@ ctText, ctJson, ctBin :: (BS.ByteString, BS.ByteString)
 ctText = ("Content-Type", "text/plain; charset=utf-8")
 ctJson = ("Content-Type", "application/json")
 ctBin  = ("Content-Type", "application/octet-stream")
+
+ctForFsPath :: FilePath -> (BS.ByteString, BS.ByteString)
+ctForFsPath rel =
+  case map toLower (takeExtension rel) of
+    ".txt"  -> ("Content-Type", "text/plain; charset=utf-8")
+    ".html" -> ("Content-Type", "text/html; charset=utf-8")
+    ".htm"  -> ("Content-Type", "text/html; charset=utf-8")
+    ".css"  -> ("Content-Type", "text/css; charset=utf-8")
+    ".js"   -> ("Content-Type", "application/javascript; charset=utf-8")
+    ".json" -> ("Content-Type", "application/json")
+    ".csv"  -> ("Content-Type", "text/csv; charset=utf-8")
+    ".xml"  -> ("Content-Type", "application/xml")
+    ".png"  -> ("Content-Type", "image/png")
+    ".jpg"  -> ("Content-Type", "image/jpeg")
+    ".jpeg" -> ("Content-Type", "image/jpeg")
+    ".gif"  -> ("Content-Type", "image/gif")
+    ".svg"  -> ("Content-Type", "image/svg+xml")
+    ".pdf"  -> ("Content-Type", "application/pdf")
+    _       -> ctBin
 
 -- ===== Request-head reading =====
 
@@ -183,8 +204,8 @@ handleConn bench sock = loop BS.empty
                           sendBuilder sock resp
 
                         Right path0 -> do
-                          let pref  = connectionPref headReq
-                              inp0  = Input rest (NSB.recv sock)
+                          let pref = connectionPref headReq
+                              inp0 = Input rest (NSB.recv sock)
 
                               expect100 =
                                    rhVersion headReq == "HTTP/1.1"
@@ -192,12 +213,12 @@ handleConn bench sock = loop BS.empty
 
                               willReadBody =
                                 framing /= NoBody &&
-                                ( path0 == "/echo"
+                                  ( path0 == "/echo"
                                   || case rhMethod headReq of
                                        PUT  -> fsRelPath path0 /= Nothing
                                        POST -> fsRelPath path0 /= Nothing
                                        _    -> False
-                                )
+                                  )
 
                           when (expect100 && willReadBody) $
                             NSB.sendAll sock "HTTP/1.1 100 Continue\r\n\r\n"
@@ -208,6 +229,7 @@ handleConn bench sock = loop BS.empty
                           case finalPref of
                             Close     -> pure ()
                             KeepAlive -> loop (inBuf inp1)
+
 -- ===== Dispatch =====
 
 dispatch
@@ -280,17 +302,17 @@ dispatch bench headReq path framing pref inp0 =
     -- ===== filesystem-backed resource routes =====
     (GET, p) | Just rel <- fsRelPath p ->
       withDrained $ \inp1 ->
-        serveFsFile ver (rhHeaders headReq) rel True inp1 pref
+        serveFsFile ver GET (rhHeaders headReq) rel True inp1 pref
 
     (HEAD, p) | Just rel <- fsRelPath p ->
       withDrained $ \inp1 ->
-        serveFsFile ver (rhHeaders headReq) rel False inp1 pref
+        serveFsFile ver HEAD (rhHeaders headReq) rel False inp1 pref
 
     (PUT, p) | Just rel <- fsRelPath p ->
-      putFsFile ver (rhHeaders headReq) rel framing inp0 pref False
+      putFsFile ver PUT (rhHeaders headReq) rel framing inp0 pref False
 
     (POST, p) | Just rel <- fsRelPath p ->
-      putFsFile ver (rhHeaders headReq) rel framing inp0 pref True
+      putFsFile ver POST (rhHeaders headReq) rel framing inp0 pref True
 
     (DELETE, p) | Just rel <- fsRelPath p ->
       withDrained $ \inp1 ->
@@ -352,7 +374,6 @@ dispatch bench headReq path framing pref inp0 =
 
 -- ===== /fs helpers =====
 
--- Map "/fs/<path>" to a safe relative FilePath (reject traversal).
 fsRelPath :: BS.ByteString -> Maybe FilePath
 fsRelPath p =
   case BS.stripPrefix "/fs/" p of
@@ -369,56 +390,98 @@ split _ "" = []
 split c s =
   let (a, b) = break (== c) s
   in a : case b of
-           []      -> []
-           (_:xs)  -> split c xs
+           []     -> []
+           (_:xs) -> split c xs
+
+data ResourceState = ResourceState
+  { rsMtime :: !UTCTime
+  , rsSize  :: !Integer
+  , rsEtag  :: !EntityTag
+  }
+
+data EntityTag = EntityTag
+  { etWeak   :: !Bool
+  , etOpaque :: !BS.ByteString
+  } deriving (Eq, Show)
+
+data PreconditionOutcome
+  = PreconditionsPass
+  | PreconditionsNotModified
+  | PreconditionsFailed
+  deriving (Eq, Show)
+
+data RangeDecision
+  = ServeFull
+  | ServePartial !Integer !Integer
+  | ServeRangeUnsat
+  deriving (Eq, Show)
 
 serveFsFile
   :: BS.ByteString
+  -> Method
   -> [Header]
   -> FilePath
   -> Bool
   -> Input
   -> ConnectionPref
   -> IO (Input, ConnectionPref, BB.Builder)
-serveFsFile ver reqHeaders rel sendBody inp pref = do
+serveFsFile ver meth reqHeaders rel sendBody inp pref = do
   let full = fsRoot </> rel
+      ct   = ctForFsPath rel
   ex <- Dir.doesFileExist full
   if not ex
     then do
       resp <- responseFor ver notFound ctText "not found\n" sendBody pref []
       pure (inp, pref, resp)
     else do
-      emtime <- try (Dir.getModificationTime full) :: IO (Either IOException UTCTime)
-      esize  <- try (Dir.getFileSize full)         :: IO (Either IOException Integer)
-      case (emtime, esize) of
-        (Right mtime0, Right size0) -> do
-          let mtime = normaliseHttpTime mtime0
-              etag  = mkFsEtag mtime size0
-              metaHdrs =
-                [ ("Last-Modified", formatHttpDate mtime)
-                , ("ETag", etag)
-                ]
+      estate <- loadResourceState full
+      case estate of
+        Left _ -> do
+          resp <- responseFor ver internalServerError ctText "IO error\n" True Close []
+          pure (inp, Close, resp)
 
-          if matchesIfNoneMatch reqHeaders etag || isNotModified reqHeaders mtime
-            then do
-              resp <- responseFor ver notModified ctBin "" False pref metaHdrs
+        Right st -> do
+          let metaHdrs = resourceMetaHeaders st
+          case evaluatePreconditions meth reqHeaders (Just st) of
+            PreconditionsFailed -> do
+              resp <- responseFor ver preconditionFailed ctText "Precondition Failed\n" True pref metaHdrs
               pure (inp, pref, resp)
-            else do
+
+            PreconditionsNotModified -> do
+              resp <- responseFor ver notModified ct "" False pref metaHdrs
+              pure (inp, pref, resp)
+
+            PreconditionsPass -> do
               ebs <- try (BS.readFile full) :: IO (Either IOException BS.ByteString)
               case ebs of
                 Left _ -> do
                   resp <- responseFor ver internalServerError ctText "IO error\n" True Close []
                   pure (inp, Close, resp)
-                Right bs -> do
-                  resp <- responseFor ver ok ctBin bs sendBody pref metaHdrs
-                  pure (inp, pref, resp)
 
-        _ -> do
-          resp <- responseFor ver internalServerError ctText "IO error\n" True Close []
-          pure (inp, Close, resp)
+                Right bs ->
+                  case decideRange reqHeaders st of
+                    ServeFull -> do
+                      resp <- responseFor ver ok ct bs sendBody pref metaHdrs
+                      pure (inp, pref, resp)
+
+                    ServeRangeUnsat -> do
+                      let extra =
+                            metaHdrs
+                              ++ [("Content-Range", unsatisfiedContentRange (rsSize st))]
+                      resp <- responseFor ver rangeNotSatisfiable ctText "Range Not Satisfiable\n" True pref extra
+                      pure (inp, pref, resp)
+
+                    ServePartial start end -> do
+                      let bodyPart = sliceBytes start end bs
+                          extra =
+                            metaHdrs
+                              ++ [("Content-Range", satisfiedContentRange start end (rsSize st))]
+                      resp <- responseFor ver partialContent ct bodyPart sendBody pref extra
+                      pure (inp, pref, resp)
 
 putFsFile
   :: BS.ByteString
+  -> Method
   -> [Header]
   -> FilePath
   -> BodyFraming
@@ -426,7 +489,7 @@ putFsFile
   -> ConnectionPref
   -> Bool
   -> IO (Input, ConnectionPref, BB.Builder)
-putFsFile ver reqHeaders rel framing inp pref createOnly = do
+putFsFile ver meth reqHeaders rel framing inp pref createOnly = do
   let full = fsRoot </> rel
   ex <- Dir.doesFileExist full
 
@@ -447,38 +510,25 @@ putFsFile ver reqHeaders rel framing inp pref createOnly = do
             pure (inp, Close, resp)
 
           Right (body, inp1) -> do
-            precondOk <-
+            mState <-
               if ex
                 then do
-                  emtime <- try (Dir.getModificationTime full) :: IO (Either IOException UTCTime)
-                  esize  <- try (Dir.getFileSize full)         :: IO (Either IOException Integer)
-                  case (emtime, esize) of
-                    (Right mtime0, Right size0) -> do
-                      let mtime = normaliseHttpTime mtime0
-                          etag  = mkFsEtag mtime size0
-                          metaHdrs =
-                            [ ("Last-Modified", formatHttpDate mtime)
-                            , ("ETag", etag)
-                            ]
-                      if passesIfUnmodifiedSince reqHeaders mtime && passesIfMatch reqHeaders etag
-                        then pure (Right ())
-                        else pure (Left (Just metaHdrs))
-                    _ -> pure (Left Nothing)
-                else
-                  if requiresExistingResource reqHeaders
-                    then pure (Left (Just []))
-                    else pure (Right ())
+                  estate <- loadResourceState full
+                  pure (either (const Nothing) Just estate)
+                else pure Nothing
 
-            case precondOk of
-              Left Nothing -> do
-                resp <- responseFor ver internalServerError ctText "IO error\n" True Close []
-                pure (inp1, Close, resp)
+            let metaHdrs = maybe [] resourceMetaHeaders mState
 
-              Left (Just metaHdrs) -> do
+            case evaluatePreconditions meth reqHeaders mState of
+              PreconditionsFailed -> do
                 resp <- responseFor ver preconditionFailed ctText "Precondition Failed\n" True pref metaHdrs
                 pure (inp1, pref, resp)
 
-              Right () -> do
+              PreconditionsNotModified -> do
+                resp <- responseFor ver preconditionFailed ctText "Precondition Failed\n" True pref metaHdrs
+                pure (inp1, pref, resp)
+
+              PreconditionsPass -> do
                 Dir.createDirectoryIfMissing True (takeDirectory full)
                 e <- try (BS.writeFile full body) :: IO (Either IOException ())
                 case e of
@@ -507,30 +557,32 @@ delFsFile ver reqHeaders rel inp pref = do
   ex <- Dir.doesFileExist full
   if not ex
     then
-      if requiresExistingResource reqHeaders
-        then do
+      case evaluatePreconditions DELETE reqHeaders Nothing of
+        PreconditionsFailed -> do
           resp <- responseFor ver preconditionFailed ctText "Precondition Failed\n" True pref []
           pure (inp, pref, resp)
-        else do
+        _ -> do
           resp <- responseFor ver notFound ctText "not found\n" True pref []
           pure (inp, pref, resp)
     else do
-      emtime <- try (Dir.getModificationTime full) :: IO (Either IOException UTCTime)
-      esize  <- try (Dir.getFileSize full)         :: IO (Either IOException Integer)
-      case (emtime, esize) of
-        (Right mtime0, Right size0) -> do
-          let mtime = normaliseHttpTime mtime0
-              etag  = mkFsEtag mtime size0
-              metaHdrs =
-                [ ("Last-Modified", formatHttpDate mtime)
-                , ("ETag", etag)
-                ]
+      estate <- loadResourceState full
+      case estate of
+        Left _ -> do
+          resp <- responseFor ver internalServerError ctText "IO error\n" True Close []
+          pure (inp, Close, resp)
 
-          if not (passesIfUnmodifiedSince reqHeaders mtime && passesIfMatch reqHeaders etag)
-            then do
+        Right st -> do
+          let metaHdrs = resourceMetaHeaders st
+          case evaluatePreconditions DELETE reqHeaders (Just st) of
+            PreconditionsFailed -> do
               resp <- responseFor ver preconditionFailed ctText "Precondition Failed\n" True pref metaHdrs
               pure (inp, pref, resp)
-            else do
+
+            PreconditionsNotModified -> do
+              resp <- responseFor ver preconditionFailed ctText "Precondition Failed\n" True pref metaHdrs
+              pure (inp, pref, resp)
+
+            PreconditionsPass -> do
               e <- try (Dir.removeFile full) :: IO (Either IOException ())
               case e of
                 Left _ -> do
@@ -540,12 +592,29 @@ delFsFile ver reqHeaders rel inp pref = do
                   resp <- responseFor ver noContent ctText "" False pref []
                   pure (inp, pref, resp)
 
-        _ -> do
-          resp <- responseFor ver internalServerError ctText "IO error\n" True Close []
-          pure (inp, Close, resp)
+loadResourceState :: FilePath -> IO (Either IOException ResourceState)
+loadResourceState full = do
+  emtime <- try (Dir.getModificationTime full) :: IO (Either IOException UTCTime)
+  esize  <- try (Dir.getFileSize full)         :: IO (Either IOException Integer)
+  pure $ do
+    mtime0 <- emtime
+    size0  <- esize
+    let mtime = normaliseHttpTime mtime0
+    pure ResourceState
+      { rsMtime = mtime
+      , rsSize  = size0
+      , rsEtag  = mkFsEtag mtime size0
+      }
+
+resourceMetaHeaders :: ResourceState -> [(BS.ByteString, BS.ByteString)]
+resourceMetaHeaders st =
+  [ ("Last-Modified", formatHttpDate (rsMtime st))
+  , ("ETag", renderEntityTag (rsEtag st))
+  , ("Accept-Ranges", "bytes")
+  ]
 
 stripQuery :: BS.ByteString -> BS.ByteString
-stripQuery bs = fst (BS.break (== 63) bs) -- '?'
+stripQuery bs = fst (BS.break (== 63) bs)
 
 allowedMethodsForPath :: BS.ByteString -> Maybe BS.ByteString
 allowedMethodsForPath path
@@ -647,70 +716,214 @@ normaliseHttpTime :: UTCTime -> UTCTime
 normaliseHttpTime =
   posixSecondsToUTCTime . fromInteger . floor . utcTimeToPOSIXSeconds
 
-mkFsEtag :: UTCTime -> Integer -> BS.ByteString
+mkFsEtag :: UTCTime -> Integer -> EntityTag
 mkFsEtag mtime size0 =
   let secs = floor (utcTimeToPOSIXSeconds (normaliseHttpTime mtime)) :: Integer
-      tag  = showHex secs "" <> "-" <> showHex size0 ""
-  in B8.pack ("\"" <> tag <> "\"")
+      tag  = B8.pack (showHex secs "" <> "-" <> showHex size0 "")
+  in EntityTag False tag
 
-matchesIfNoneMatch :: [Header] -> BS.ByteString -> Bool
-matchesIfNoneMatch hs etag =
-  case headerLookupAll "If-None-Match" hs of
-    [] -> False
-    vals ->
-      any (\raw -> "*" `elemTag` raw || etag `elemTag` raw) vals
+renderEntityTag :: EntityTag -> BS.ByteString
+renderEntityTag (EntityTag weak opaque) =
+  (if weak then "W/" else "") <> "\"" <> opaque <> "\""
 
-passesIfMatch :: [Header] -> BS.ByteString -> Bool
-passesIfMatch hs etag =
-  case headerLookupAll "If-Match" hs of
+parseEntityTag :: BS.ByteString -> Maybe EntityTag
+parseEntityTag raw0 =
+  let raw = trimOWS raw0
+  in case BS.stripPrefix "W/" raw of
+       Just rest -> EntityTag True <$> parseQuotedOpaque rest
+       Nothing   -> EntityTag False <$> parseQuotedOpaque raw
+
+parseQuotedOpaque :: BS.ByteString -> Maybe BS.ByteString
+parseQuotedOpaque bs = do
+  inner0 <- BS.stripPrefix "\"" bs
+  case BS.unsnoc inner0 of
+    Just (inner, 34) -> Just inner
+    _                -> Nothing
+
+data ETagToken = AnyTag | SpecificTag EntityTag
+
+parseETagList :: BS.ByteString -> [ETagToken]
+parseETagList raw =
+  mapMaybe parseOne (BS.split 44 raw)
+  where
+    parseOne tok0 =
+      let tok = trimOWS tok0
+      in if tok == "*"
+           then Just AnyTag
+           else SpecificTag <$> parseEntityTag tok
+
+strongCompare :: EntityTag -> EntityTag -> Bool
+strongCompare a b =
+  not (etWeak a) && not (etWeak b) && etOpaque a == etOpaque b
+
+weakCompare :: EntityTag -> EntityTag -> Bool
+weakCompare a b =
+  etOpaque a == etOpaque b
+
+hasIfMatchHeader :: [Header] -> Bool
+hasIfMatchHeader hs = not (null (headerLookupAll "If-Match" hs))
+
+hasIfNoneMatchHeader :: [Header] -> Bool
+hasIfNoneMatchHeader hs = not (null (headerLookupAll "If-None-Match" hs))
+
+ifMatchSatisfied :: [Header] -> Maybe ResourceState -> Bool
+ifMatchSatisfied hs mState =
+  case concatMap parseETagList (headerLookupAll "If-Match" hs) of
     [] -> True
-    vals ->
-      any (\raw -> "*" `elemTag` raw || etag `elemTag` raw) vals
+    toks ->
+      case mState of
+        Nothing -> False
+        Just st ->
+          any (matchesCurrentStrong (rsEtag st)) toks
+  where
+    matchesCurrentStrong _ AnyTag             = True
+    matchesCurrentStrong cur (SpecificTag et) = strongCompare cur et
 
-requiresExistingResource :: [Header] -> Bool
-requiresExistingResource hs =
-  case headerLookupAll "If-Match" hs of
+ifNoneMatchMatched :: [Header] -> Maybe ResourceState -> Bool
+ifNoneMatchMatched hs mState =
+  case concatMap parseETagList (headerLookupAll "If-None-Match" hs) of
     [] -> False
-    vals -> any (\raw -> "*" `elemTag` raw || not (null (parseEtags raw))) vals
+    toks ->
+      case mState of
+        Nothing -> False
+        Just st ->
+          any (matchesCurrentWeak (rsEtag st)) toks
+  where
+    matchesCurrentWeak _   AnyTag             = True
+    matchesCurrentWeak cur (SpecificTag et)   = weakCompare cur et
 
-elemTag :: BS.ByteString -> BS.ByteString -> Bool
-elemTag needle raw = needle `elem` parseEtags raw
-
-parseEtags :: BS.ByteString -> [BS.ByteString]
-parseEtags raw =
-  [ normaliseEtTag tok
-  | tok0 <- BS.split 44 raw
-  , let tok = trimOWS tok0
-  , not (BS.null tok)
-  ]
-
-normaliseEtTag :: BS.ByteString -> BS.ByteString
-normaliseEtTag tok =
-  case BS.stripPrefix "W/" tok of
-    Just rest -> trimOWS rest
-    Nothing   -> tok
-
-isNotModified :: [Header] -> UTCTime -> Bool
-isNotModified hs mtime =
-  case headerLookupAll "If-Modified-Since" hs of
-    [] -> False
-    vals ->
+isNotModifiedSince :: [Header] -> Maybe ResourceState -> Bool
+isNotModifiedSince hs mState =
+  case mState of
+    Nothing -> False
+    Just st ->
       any
         (\raw -> case parseHttpDate raw of
-                   Nothing  -> False
-                   Just t   -> normaliseHttpTime mtime <= normaliseHttpTime t)
-        vals
+                   Nothing -> False
+                   Just t  -> rsMtime st <= normaliseHttpTime t)
+        (headerLookupAll "If-Modified-Since" hs)
 
-passesIfUnmodifiedSince :: [Header] -> UTCTime -> Bool
-passesIfUnmodifiedSince hs mtime =
+passesIfUnmodifiedSince :: [Header] -> Maybe ResourceState -> Bool
+passesIfUnmodifiedSince hs mState =
   case headerLookupAll "If-Unmodified-Since" hs of
     [] -> True
     vals ->
-      any
-        (\raw -> case parseHttpDate raw of
-                   Nothing -> True
-                   Just t  -> normaliseHttpTime mtime <= normaliseHttpTime t)
-        vals
+      case mState of
+        Nothing -> True
+        Just st ->
+          any
+            (\raw -> case parseHttpDate raw of
+                       Nothing -> True
+                       Just t  -> rsMtime st <= normaliseHttpTime t)
+            vals
+
+methodIsRetrieval :: Method -> Bool
+methodIsRetrieval GET  = True
+methodIsRetrieval HEAD = True
+methodIsRetrieval _    = False
+
+evaluatePreconditions :: Method -> [Header] -> Maybe ResourceState -> PreconditionOutcome
+evaluatePreconditions meth hs mState
+  | hasIfMatchHeader hs && not (ifMatchSatisfied hs mState) =
+      PreconditionsFailed
+  | not (hasIfMatchHeader hs) && not (passesIfUnmodifiedSince hs mState) =
+      PreconditionsFailed
+  | hasIfNoneMatchHeader hs && ifNoneMatchMatched hs mState =
+      if methodIsRetrieval meth
+        then PreconditionsNotModified
+        else PreconditionsFailed
+  | not (hasIfNoneMatchHeader hs)
+      && methodIsRetrieval meth
+      && isNotModifiedSince hs mState =
+      PreconditionsNotModified
+  | otherwise =
+      PreconditionsPass
+
+data IfRangeValue
+  = IfRangeETag !EntityTag
+  | IfRangeDate !UTCTime
+
+parseIfRangeValue :: BS.ByteString -> Maybe IfRangeValue
+parseIfRangeValue raw =
+  case parseEntityTag (trimOWS raw) of
+    Just et -> Just (IfRangeETag et)
+    Nothing -> IfRangeDate <$> parseHttpDate raw
+
+ifRangeAllows :: [Header] -> ResourceState -> Bool
+ifRangeAllows hs st =
+  case headerLookupAll "If-Range" hs of
+    [] -> True
+    raw:_ ->
+      case parseIfRangeValue raw of
+        Just (IfRangeETag et) -> strongCompare (rsEtag st) et
+        Just (IfRangeDate t)  -> rsMtime st <= normaliseHttpTime t
+        Nothing               -> False
+
+decideRange :: [Header] -> ResourceState -> RangeDecision
+decideRange hs st =
+  case headerLookupAll "Range" hs of
+    [] -> ServeFull
+    raw:_ ->
+      if not (ifRangeAllows hs st)
+        then ServeFull
+        else parseSingleRange raw (rsSize st)
+
+parseSingleRange :: BS.ByteString -> Integer -> RangeDecision
+parseSingleRange raw0 totalSize =
+  let raw = trimOWS raw0
+  in case BS.stripPrefix "bytes=" raw of
+       Nothing   -> ServeFull
+       Just spec ->
+         if BS.elem 44 spec
+           then ServeFull
+           else
+             let (lhs0, rhsWithDash) = BS.break (== 45) spec
+             in case BS.uncons rhsWithDash of
+                  Nothing -> ServeFull
+                  Just (45, rhs0) ->
+                    let lhs = trimOWS lhs0
+                        rhs = trimOWS rhs0
+                    in case (parseDecMaybe lhs, parseDecMaybe rhs) of
+                         (Nothing, Nothing) -> ServeFull
+                         (Just _, Nothing) ->
+                           case parseDecMaybe lhs of
+                             Just start
+                               | totalSize <= 0      -> ServeRangeUnsat
+                               | start >= totalSize  -> ServeRangeUnsat
+                               | otherwise           -> ServePartial start (totalSize - 1)
+                             _ -> ServeFull
+                         (Nothing, Just suffixLen)
+                           | suffixLen <= 0 -> ServeFull
+                           | totalSize <= 0 -> ServeRangeUnsat
+                           | suffixLen >= totalSize -> ServePartial 0 (totalSize - 1)
+                           | otherwise ->
+                               ServePartial (totalSize - suffixLen) (totalSize - 1)
+                         (Just start, Just end)
+                           | start > end    -> ServeFull
+                           | totalSize <= 0 -> ServeRangeUnsat
+                           | start >= totalSize -> ServeRangeUnsat
+                           | otherwise      -> ServePartial start (min end (totalSize - 1))
+
+parseDecMaybe :: BS.ByteString -> Maybe Integer
+parseDecMaybe bs
+  | BS.null bs = Nothing
+  | BS.any (\w -> w < 48 || w > 57) bs = Nothing
+  | otherwise = Just (BS.foldl' (\acc w -> acc * 10 + toInteger (w - 48)) 0 bs)
+
+sliceBytes :: Integer -> Integer -> BS.ByteString -> BS.ByteString
+sliceBytes start end =
+  BS.take (fromIntegral (end - start + 1)) . BS.drop (fromIntegral start)
+
+satisfiedContentRange :: Integer -> Integer -> Integer -> BS.ByteString
+satisfiedContentRange start end total =
+  "bytes " <> bsShowI start <> "-" <> bsShowI end <> "/" <> bsShowI total
+
+unsatisfiedContentRange :: Integer -> BS.ByteString
+unsatisfiedContentRange total =
+  "bytes */" <> bsShowI total
+
+bsShowI :: Integer -> BS.ByteString
+bsShowI = B8.pack . show
 
 -- ===== Response helpers =====
 
