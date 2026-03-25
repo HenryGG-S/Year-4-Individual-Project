@@ -1,0 +1,13 @@
+requests=118709
+duration_s=60.000684
+bytes=139008239
+rps=1978.46
+p50_ms=510.719
+p95_ms=678.399
+p99_ms=707.583
+p999_ms=717.311
+err_connect=0
+err_read=0
+err_write=0
+err_status=0
+err_timeout=0
