@@ -40,6 +40,8 @@ WRK="wrk2"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNS_DIR="$ROOT/bench/runs"
+BENCH_MAIN_DIR="$ROOT/bench_files"
+BENCH_BASELINE_DIR="$ROOT/comparison_baselines/bench_files"
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="$RUNS_DIR/${TS}_${NAME}_R${RATE}_c${CONNS}_t${THREADS}_d${DURATION}s${RUN_INDEX:+_run${RUN_INDEX}}"
 mkdir -p "$OUT_DIR"
@@ -48,7 +50,14 @@ if [[ -z "$RAW_CSV" ]]; then
   RAW_CSV="$ROOT/bench/raw_runs.csv"
 fi
 mkdir -p "$(dirname "$RAW_CSV")"
-
+checksum_file() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1 && [[ -f "$f" ]]; then
+    sha256sum "$f" | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
 {
   echo "timestamp=$TS"
   echo "name=$NAME"
@@ -65,6 +74,12 @@ mkdir -p "$(dirname "$RAW_CSV")"
   echo "stack_version=$(stack --version 2>/dev/null || true)"
   echo "ghc_version=$(stack ghc -- --version 2>/dev/null || true)"
   echo "wrk_version=$($WRK --version 2>/dev/null || true)"
+  echo "bench_json1k_sha256=$(checksum_file "$BENCH_MAIN_DIR/json1k.json")"
+  echo "bench_file50k_sha256=$(checksum_file "$BENCH_MAIN_DIR/file50k.bin")"
+  echo "bench_file1m_sha256=$(checksum_file "$BENCH_MAIN_DIR/file1m.bin")"
+  echo "baseline_json1k_sha256=$(checksum_file "$BENCH_BASELINE_DIR/json1k.json")"
+  echo "baseline_file50k_sha256=$(checksum_file "$BENCH_BASELINE_DIR/file50k.bin")"
+  echo "baseline_file1m_sha256=$(checksum_file "$BENCH_BASELINE_DIR/file1m.bin")"
 } > "$OUT_DIR/meta.txt"
 
 set +e

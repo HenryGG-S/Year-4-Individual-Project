@@ -10,6 +10,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import System.Timeout (timeout)
 import Http.Framing (BodyFraming(..))
+import Data.Word (Word8)
 
 data Input = Input
   { inBuf  :: !BS.ByteString
@@ -105,17 +106,19 @@ drainExact n inp
 readLineCRLF :: Input -> IO (Either BodyError (BS.ByteString, Input))
 readLineCRLF inp = go inp
   where
-    go i =
-      case B8.breakSubstring "\r\n" (inBuf i) of
-        (pre, rest)
-          | BS.null rest -> do
-              ei' <- recvMore i
-              case ei' of
-                Left e  -> pure (Left e)
-                Right j -> go j
-          | otherwise ->
-              let remaining = BS.drop 2 rest
-              in pure (Right (pre, i { inBuf = remaining }))
+    go i
+      | BS.length (inBuf i) > maxChunkLineBytes = pure (Left BodyMalformedChunked)
+      | otherwise =
+          case B8.breakSubstring "\r\n" (inBuf i) of
+            (pre, rest)
+              | BS.null rest -> do
+                  ei' <- recvMore i
+                  case ei' of
+                    Left e  -> pure (Left e)
+                    Right j -> go j
+              | otherwise ->
+                  let remaining = BS.drop 2 rest
+                  in pure (Right (pre, i { inBuf = remaining }))
 
 readChunkedStrict :: Input -> IO (Either BodyError (BS.ByteString, Input))
 readChunkedStrict inp0 = go BS.empty inp0
@@ -195,10 +198,14 @@ parseHex bs
     step acc w = do
       n <- acc
       d <- hexVal w
-      pure (n * 16 + toInteger d)
+      pure (n * 16 + d)
 
+    hexVal :: Word8 -> Maybe Integer
     hexVal w
-      | w >= 48 && w <= 57  = Just (fromIntegral w - 48)
-      | w >= 65 && w <= 70  = Just (fromIntegral w - 55)
-      | w >= 97 && w <= 102 = Just (fromIntegral w - 87)
+      | w >= 48 && w <= 57  = Just (toInteger w - 48)
+      | w >= 65 && w <= 70  = Just (toInteger w - 55)
+      | w >= 97 && w <= 102 = Just (toInteger w - 87)
       | otherwise           = Nothing
+
+maxChunkLineBytes :: Int
+maxChunkLineBytes = 8192

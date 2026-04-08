@@ -1,41 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUT_DIR="${1:-comparison_baselines}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_DIR="$ROOT/comparison_baselines"
+PROVISION_FLASK=1
+
+usage() {
+  cat <<'USAGE'
+Usage: ./create_comparison_baselines.sh [options] [out_dir]
+
+Options:
+  --no-provision-flask   Generate files only; do not create/update the Flask virtualenv
+  --help                 Show this help
+
+Arguments:
+  out_dir                Target directory for generated baselines
+                         (default: ./comparison_baselines)
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-provision-flask) PROVISION_FLASK=0; shift ;;
+    --help) usage; exit 0 ;;
+    -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    *) OUT_DIR="$1"; shift ;;
+  esac
+done
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: $1 not found" >&2; exit 1; }; }
+die() { echo "Error: $*" >&2; exit 1; }
+
+need_cmd python3
+
+MAIN_BENCH_DIR="$ROOT/bench_files"
+[[ -d "$MAIN_BENCH_DIR" ]] || die "Missing $MAIN_BENCH_DIR. The main benchmark corpus must exist before generating baselines."
 
 mkdir -p "$OUT_DIR"/{flask,nginx,go,scripts,bench_files}
 
-# ------------------------------------------------------------------
-# Generate payload files to match the Haskell project exactly
-# ------------------------------------------------------------------
-python3 - <<'PY' "$OUT_DIR/bench_files"
-from pathlib import Path
-import os
-import sys
+copy_bench_corpus() {
+  local src="$MAIN_BENCH_DIR"
+  local dst="$OUT_DIR/bench_files"
+  local files=(json1k.json file50k.bin file1m.bin)
 
-bench = Path(sys.argv[1])
-bench.mkdir(parents=True, exist_ok=True)
+  for f in "${files[@]}"; do
+    [[ -f "$src/$f" ]] || die "Missing benchmark corpus file: $src/$f"
+    cp "$src/$f" "$dst/$f"
+  done
+}
 
-len_json1k = 1024
-len_file50k = 50 * 1024
-len_file1m = 1024 * 1024
-
-prefix = b'{"ok":true,"pad":"'
-suffix = b'"}\n'
-pad_len = len_json1k - (len(prefix) + len(suffix))
-json1k = prefix + (b'a' * pad_len) + suffix
-
-assert len(json1k) == len_json1k
-
-(bench / "json1k.json").write_bytes(json1k)
-(bench / "file50k.bin").write_bytes(os.urandom(len_file50k))
-(bench / "file1m.bin").write_bytes(os.urandom(len_file1m))
-PY
-
-# ------------------------------------------------------------------
-# Flask baseline
-# ------------------------------------------------------------------
-cat > "$OUT_DIR/flask/app.py" <<'PY'
+write_flask_files() {
+  cat > "$OUT_DIR/flask/app.py" <<'PYAPP'
 from pathlib import Path
 from flask import Flask, Response
 
@@ -44,47 +59,92 @@ BENCH = ROOT / "bench_files"
 
 app = Flask(__name__)
 
+
 def _read(name: str) -> bytes:
     return (BENCH / name).read_bytes()
+
 
 JSON1K = _read("json1k.json")
 FILE50K = _read("file50k.bin")
 FILE1M = _read("file1m.bin")
 
+
 @app.get("/")
 def index() -> Response:
     return Response(b"ok\n", mimetype="text/plain")
+
 
 @app.get("/health")
 def health() -> Response:
     return Response(b"healthy\n", mimetype="text/plain")
 
+
 @app.get("/json")
 def json1k() -> Response:
     return Response(JSON1K, mimetype="application/json")
+
 
 @app.get("/file50k")
 def file50k() -> Response:
     return Response(FILE50K, mimetype="application/octet-stream")
 
+
 @app.get("/file1m")
 def file1m() -> Response:
     return Response(FILE1M, mimetype="application/octet-stream")
+
 
 @app.errorhandler(404)
 def not_found(_err):
     return Response(b"not found\n", status=404, mimetype="text/plain")
 
-if __name__ == "__main__":
-    # Development only. Do not use this for dissertation benchmarks.
-    app.run(host="127.0.0.1", port=8082)
-PY
 
-cat > "$OUT_DIR/flask/run_gunicorn.sh" <<'SH'
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=8082)
+PYAPP
+
+  cat > "$OUT_DIR/flask/requirements.txt" <<'REQ'
+flask
+gunicorn
+REQ
+
+  cat > "$OUT_DIR/flask/run_gunicorn.sh" <<'GUNICORN'
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
-exec gunicorn \
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$SCRIPT_DIR/.venv"
+PYTHON_BIN="$VENV/bin/python"
+REQ_FILE="$SCRIPT_DIR/requirements.txt"
+ENSURE_ONLY=0
+
+if [[ "${1:-}" == "--ensure-only" ]]; then
+  ENSURE_ONLY=1
+fi
+
+ensure_flask_env() {
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    python3 -m venv "$VENV"
+  fi
+
+  if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import flask  # noqa: F401
+import gunicorn  # noqa: F401
+PY
+  then
+    "$PYTHON_BIN" -m pip install --upgrade pip >/dev/null
+    "$PYTHON_BIN" -m pip install -r "$REQ_FILE"
+  fi
+}
+
+cd "$SCRIPT_DIR"
+ensure_flask_env
+
+if [[ "$ENSURE_ONLY" -eq 1 ]]; then
+  exit 0
+fi
+
+exec "$PYTHON_BIN" -m gunicorn \
   --bind 127.0.0.1:8082 \
   --workers 1 \
   --worker-class sync \
@@ -92,15 +152,15 @@ exec gunicorn \
   --preload \
   --access-logfile - \
   app:app
-SH
-chmod +x "$OUT_DIR/flask/run_gunicorn.sh"
+GUNICORN
+  chmod +x "$OUT_DIR/flask/run_gunicorn.sh"
+}
 
-# ------------------------------------------------------------------
-# nginx baseline
-# Self-contained config: no external mime.types dependency
-# ------------------------------------------------------------------
-cat > "$OUT_DIR/nginx/nginx.conf" <<'NGINX'
+write_nginx_files() {
+  cat > "$OUT_DIR/nginx/nginx.conf" <<'NGINX'
 worker_processes 1;
+pid nginx.pid;
+error_log stderr notice;
 
 events {
     worker_connections 1024;
@@ -110,6 +170,14 @@ http {
     default_type application/octet-stream;
     sendfile on;
     keepalive_timeout 65;
+
+    access_log off;
+
+    client_body_temp_path client_temp;
+    proxy_temp_path proxy_temp;
+    fastcgi_temp_path fastcgi_temp;
+    uwsgi_temp_path uwsgi_temp;
+    scgi_temp_path scgi_temp;
 
     server {
         listen 8083;
@@ -148,33 +216,32 @@ http {
 }
 NGINX
 
-cat > "$OUT_DIR/scripts/render_nginx_conf.sh" <<'SH'
+  cat > "$OUT_DIR/scripts/render_nginx_conf.sh" <<'RENDER'
 #!/usr/bin/env bash
 set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATIC_ROOT="$ROOT/bench_files"
 TEMPLATE="$ROOT/nginx/nginx.conf"
 OUTPUT="$ROOT/nginx/nginx.rendered.conf"
 
-# Escape slashes for sed replacement
 ESCAPED_STATIC_ROOT=$(printf '%s\n' "$STATIC_ROOT" | sed 's/[\/&]/\\&/g')
 sed "s#__STATIC_ROOT__#$ESCAPED_STATIC_ROOT#g" "$TEMPLATE" > "$OUTPUT"
 
 echo "Rendered: $OUTPUT"
-SH
-chmod +x "$OUT_DIR/scripts/render_nginx_conf.sh"
+RENDER
+  chmod +x "$OUT_DIR/scripts/render_nginx_conf.sh"
+}
 
-# ------------------------------------------------------------------
-# Go baseline (optional)
-# ------------------------------------------------------------------
-cat > "$OUT_DIR/go/go.mod" <<'GO'
+write_go_files() {
+  cat > "$OUT_DIR/go/go.mod" <<'GOMOD'
 module comparison-baseline-go
 
 go 1.22
-GO
+GOMOD
 
-cat > "$OUT_DIR/go/main.go" <<'GO'
+  cat > "$OUT_DIR/go/main.go" <<'GOMAIN'
 package main
 
 import (
@@ -237,44 +304,14 @@ func main() {
 	log.Println("Go baseline on :8084")
 	log.Fatal(http.ListenAndServe("127.0.0.1:8084", mux))
 }
-GO
+GOMAIN
+}
 
-# ------------------------------------------------------------------
-# Bench helper
-# ------------------------------------------------------------------
-cat > "$OUT_DIR/scripts/benchmark_matrix.sh" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
-PROJECT_ROOT="${1:-}"
-if [[ -z "$PROJECT_ROOT" ]]; then
-  echo "Usage: $0 /path/to/webserver"
-  exit 1
-fi
-
-cd "$PROJECT_ROOT"
-
-./scripts/bench.sh --url http://127.0.0.1:8080/json   --rate 2000 --name custom_json
-./scripts/bench.sh --url http://127.0.0.1:8081/json   --rate 2000 --name warp_json
-./scripts/bench.sh --url http://127.0.0.1:8082/json   --rate 2000 --name flask_json
-./scripts/bench.sh --url http://127.0.0.1:8083/json   --rate 2000 --name nginx_json
-./scripts/bench.sh --url http://127.0.0.1:8084/json   --rate 2000 --name go_json
-
-./scripts/bench.sh --url http://127.0.0.1:8080/file1m --rate 200 --conns 50 --name custom_file1m
-./scripts/bench.sh --url http://127.0.0.1:8081/file1m --rate 200 --conns 50 --name warp_file1m
-./scripts/bench.sh --url http://127.0.0.1:8082/file1m --rate 200 --conns 50 --name flask_file1m
-./scripts/bench.sh --url http://127.0.0.1:8083/file1m --rate 200 --conns 50 --name nginx_file1m
-./scripts/bench.sh --url http://127.0.0.1:8084/file1m --rate 200 --conns 50 --name go_file1m
-SH
-chmod +x "$OUT_DIR/scripts/benchmark_matrix.sh"
-
-# ------------------------------------------------------------------
-# README
-# ------------------------------------------------------------------
-cat > "$OUT_DIR/README.md" <<'MD'
+write_readme() {
+  cat > "$OUT_DIR/README.md" <<'README'
 # Comparison baselines for the dissertation
 
-This bundle provides minimal comparison servers aligned with the current Haskell project routes and payload sizes.
+This directory is generated by `./create_comparison_baselines.sh` and is intended to be driven through `./scripts/run_all_benchmarks.sh`.
 
 Routes:
 - /
@@ -290,28 +327,29 @@ Ports:
 - nginx static baseline: 8083
 - Go net/http baseline: 8084
 
-## Flask
-cd flask
-python3 -m venv .venv
-source .venv/bin/activate
-pip install flask gunicorn
-./run_gunicorn.sh
+## Notes
+- The benchmark corpus is copied from the main project's `bench_files/` so all baselines serve byte-identical payloads.
+- The Flask runner bootstraps its own virtualenv on first use.
+- `nginx`, `go`, `wrk2`, `stack`, `curl`, and `python3` remain external system prerequisites.
+- Preferred entrypoint: `./scripts/run_all_benchmarks.sh`
+README
+}
 
-## nginx
-../scripts/render_nginx_conf.sh
-nginx -p "$PWD" -c nginx.rendered.conf
+provision_flask() {
+  echo "[init] Provisioning Flask baseline virtualenv..."
+  "$OUT_DIR/flask/run_gunicorn.sh" --ensure-only
+}
 
-Stop:
-nginx -p "$PWD" -c nginx.rendered.conf -s stop
+copy_bench_corpus
+write_flask_files
+write_nginx_files
+write_go_files
+write_readme
 
-## Go
-cd go
-go run .
-
-## Method note
-- Benchmark Flask through Gunicorn, not Flask's dev server.
-- nginx is a valid baseline, but it is not a like-for-like application framework comparison.
-- Go net/http is optional but useful as another application-server baseline.
-MD
+if [[ "$PROVISION_FLASK" -eq 1 ]]; then
+  provision_flask
+else
+  echo "[init] Skipping Flask virtualenv provisioning"
+fi
 
 echo "Created comparison baselines in: $OUT_DIR"

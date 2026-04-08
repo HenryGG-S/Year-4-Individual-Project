@@ -1,109 +1,98 @@
-# Year 4 Individual Project — Haskell HTTP/1.1 Server (Tail Latency Study)
+# Year 4 Individual Project — Haskell HTTP/1.1 Server Tail-Latency Study
 
-This repository contains my Year 4 dissertation project: implementing a lean, standards-aware HTTP/1.1 server in Haskell and benchmarking its tail-latency behaviour (p95–p99.9) under open-loop load, with comparisons against Warp.
+This repository contains the implementation and benchmarking code for a dissertation project on the tail latency of a lean, standards-aware HTTP/1.1 server written in Haskell.
 
 ## Repository layout
 
-- `webserver/` — Haskell server implementation (Stack project)
-- (Other folders may be added later: report, benchmarks, plots, etc.)
+- `webserver/` — main Stack project
+  - `src/` — server, parser, framing, response, and workload code
+  - `app/` — custom server executable
+  - `app-warp/` — Warp baseline executable
+  - `test/` — socket-level end-to-end tests
+  - `scripts/` — benchmark orchestration and summarisation scripts
+  - `bench/` — benchmark outputs, sessions, and logs
+  - `bench_files/` — shared benchmark payload corpus used by the Haskell side
+  - `comparison_baselines/` — Flask + Gunicorn, nginx, and Go baselines plus mirrored payloads
 
-> If you’re looking for implementation details, start in `webserver/`.
+## What is included
 
----
+- a custom HTTP/1.1 server in Haskell
+- a Warp baseline implemented in the same Stack project
+- filesystem-backed resource routes used for protocol and cache-validator testing
+- socket-level tests for parsing, framing, conditional requests, and method semantics
+- open-loop benchmarking via `wrk2`
+- comparison baselines for:
+  - Warp
+  - Flask + Gunicorn
+  - nginx static serving
+  - Go `net/http`
 
-## Quick start (Linux)
-
-### 1) Install system dependencies (Debian/Ubuntu)
-
-Stack’s docs list the common build dependencies required for GHC/tooling on Linux. On Debian/Ubuntu, this is usually enough: :contentReference[oaicite:1]{index=1}
+## Quick start
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y \
-  g++ gcc libc6-dev libffi-dev libgmp-dev make xz-utils zlib1g-dev \
-  git gnupg netbase
-
-curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | sh
-
-source ~/.bashrc   # or ~/.zshrc
-stack --version
-ghc --version
-
 git clone https://github.com/HenryGG-S/Year-4-Individual-Project.git
 cd Year-4-Individual-Project/webserver
 
-# Install the right GHC for the resolver (if needed)
 stack setup
-
-# Build
 stack build
+stack test
+```
 
-# Run (runs the first executable in the project)
-stack run
+Run the custom server:
 
-#running with rts stats - useful later in the project
-stack run -- +RTS -N -s -RTS
+```bash
+stack exec -- webserver-exe
+```
 
--N uses all cores
+Run the Warp baseline:
 
--s prints GC/runtime stats on exit
+```bash
+stack exec -- warp-baseline
+```
 
-(Stack run behaviour is documented here: stack run builds and runs a project executable.)
+## Benchmarking
 
-Troubleshooting
-“stack: command not found”
+Run one benchmark with fixed-rate load:
 
-Your PATH isn’t set up. If you installed via GHCup, Stack is typically in:
+```bash
+./scripts/bench.sh \
+  --name lean_json \
+  --url http://127.0.0.1:8080/json \
+  --rate 2000 \
+  --duration 60 \
+  --threads 2 \
+  --conns 100
+```
 
-~/.ghcup/bin
+Run the full benchmark session across the configured baselines:
 
-or ~/.local/bin
+```bash
+./scripts/run_all_benchmarks.sh
+```
 
-Add one (or both) to PATH in ~/.bashrc:
+If you need to regenerate or refresh the comparison baseline bundle:
 
-export PATH="$HOME/.ghcup/bin:$HOME/.local/bin:$PATH"
+```bash
+./create_comparison_baselines.sh
+```
 
+## Notes on the baselines
 
-Restart your terminal or run source ~/.bashrc.
+- Warp is the closest Haskell baseline.
+- Flask is benchmarked through Gunicorn, not Flask’s development server.
+- nginx is a valid and useful static-file baseline, but it is not a like-for-like application-server comparison.
+- Go `net/http` is included as another application-server baseline.
 
-Stack can’t install GHC / complains about missing libraries
+## Reproducibility
 
-You’re usually missing system packages like libgmp, libffi, zlib, or xz. Re-run the Debian/Ubuntu dependency install shown above.
+The benchmark scripts record run metadata including:
+- code revision
+- runtime and toolchain details
+- load parameters
+- per-run outputs and summaries
 
-“No project config file found” or Stack isn’t using the right stack.yaml
+The benchmark payload corpus is intentionally fixed-size and shared across implementations to keep comparisons fair.
 
-Make sure you’re inside the Stack project directory:
+## Dissertation focus
 
-cd Year-4-Individual-Project/webserver
-ls
-
-
-You should see a stack.yaml in that directory.
-
-Builds are failing in strange ways after changes
-
-Try a clean rebuild:
-
-stack clean
-stack build
-
-
-If it’s really stuck (rare), delete .stack-work/ in the project directory:
-
-rm -rf .stack-work
-stack build
-
-Downloads are failing (TLS / proxy / network)
-
-Ensure system clock is correct
-
-Try a different network
-
-If you’re behind a corporate proxy, you may need to configure Stack’s network settings
-
-Notes
-
-This project is in active development.
-
-Benchmarking harness + workloads + Warp comparison tooling will be added as the implementation stabilises.
-
+The core research focus is tail latency under controlled load, not protocol completeness for its own sake. The implementation therefore aims to be lean, explicit in scope, and strong on the HTTP/1.1 behaviours that are directly relevant to the study.

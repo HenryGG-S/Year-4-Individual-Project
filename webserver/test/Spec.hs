@@ -69,6 +69,14 @@ runAll port = and <$> sequence
   , testFsPutIfMatchSucceeds port
   , testFsDeleteIfMatchFails port
   , testFsDeleteIfMatchSucceeds port
+  , testUnsupportedTransferEncoding501 port
+  , testChunkedLongLine400 port
+  , testFsGetRange206 port
+  , testFsGetRange416 port
+  , testFsHeadIgnoresRange port
+  , testFsIfRangeDateExactMatch206 port
+  , testFsIfRangeDateMismatch200 port
+  , testFsIfRangeEtagMatch206 port
   ]
 
 -- ===== Helpers =====
@@ -1158,3 +1166,218 @@ testFsDeleteIfMatchSucceeds port = do
 
       assert "DELETE If-Match success removes resource"
         (("HTTP/1.1 204 No Content" `BS.isPrefixOf` out) && gone)
+
+-- ===== range / If-Range / unsupported TE / bounded chunk-line tests =====
+
+seedFsBody :: Int -> BS.ByteString -> BS.ByteString -> IO ()
+seedFsBody port p body = do
+  _ <- withConn port $ \s -> do
+    let cl = B8.pack (show (BS.length body))
+    NSB.sendAll s $
+      "PUT " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Content-Length: " <> cl <> "\r\n" <>
+      "Connection: close\r\n\r\n" <>
+      body
+    _ <- recvUntilQuiet s
+    pure ()
+  pure ()
+
+fetchFsHeader :: Int -> BS.ByteString -> BS.ByteString -> IO (Maybe BS.ByteString)
+fetchFsHeader port p name =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    pure $ case mh of
+      Nothing        -> Nothing
+      Just (hdrs, _) -> headerValue name hdrs
+
+testUnsupportedTransferEncoding501 :: Int -> IO Bool
+testUnsupportedTransferEncoding501 port =
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Transfer-Encoding: gzip\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "unsupported Transfer-Encoding -> 501"
+      ("HTTP/1.1 501 Not Implemented" `BS.isPrefixOf` out)
+
+testChunkedLongLine400 :: Int -> IO Bool
+testChunkedLongLine400 port =
+  withConn port $ \s -> do
+    let longExt = BS.replicate 9000 97 -- 'a'
+    NSB.sendAll s $
+      "POST /echo HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Transfer-Encoding: chunked\r\n" <>
+      "Connection: close\r\n\r\n" <>
+      "1;" <> longExt <> "\r\n" <>
+      "a\r\n" <>
+      "0\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "overlong chunk-size line rejected"
+      ("HTTP/1.1 400" `BS.isPrefixOf` out)
+
+testFsGetRange206 :: Int -> IO Bool
+testFsGetRange206 port = do
+  let p = "/fs/spec_range_206.txt"
+  seedFsBody port p "hello"
+
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Range: bytes=1-3\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    case mh of
+      Nothing -> assert "GET range 206 headers received" False
+      Just (hdrs, rest0) -> do
+        let okStatus = statusIs "206 Partial Content" hdrs
+            okLen    = expectContentLength 3 hdrs
+            okCR     = headerValue "Content-Range" hdrs == Just "bytes 1-3/5"
+            need     = 3 - BS.length rest0
+        mb <- if need <= 0 then pure (Just (BS.take 3 rest0))
+                           else do
+                             mmore <- recvExactly s need
+                             pure ((rest0 <>) <$> mmore)
+        case mb of
+          Nothing   -> assert "GET range 206 reads full body" False
+          Just body -> assert "GET range bytes=1-3 -> 206 + sliced body"
+            (okStatus && okLen && okCR && body == "ell")
+
+testFsGetRange416 :: Int -> IO Bool
+testFsGetRange416 port = do
+  let p = "/fs/spec_range_416.txt"
+  seedFsBody port p "hello"
+
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Range: bytes=99-100\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    assert "GET unsatisfiable range -> 416 with bytes */N"
+      (("HTTP/1.1 416 Range Not Satisfiable" `BS.isPrefixOf` out) &&
+       ("Content-Range: bytes */5\r\n" `BS.isInfixOf` out))
+
+testFsHeadIgnoresRange :: Int -> IO Bool
+testFsHeadIgnoresRange port = do
+  let p = "/fs/spec_head_range.txt"
+  seedFsBody port p "hello"
+
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "HEAD " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Range: bytes=0-0\r\n" <>
+      "Connection: close\r\n\r\n"
+    out <- recvUntilQuiet s
+    let after = bodyAfterHeaders out
+    assert "HEAD ignores Range and returns full metadata only"
+      (("HTTP/1.1 200 OK" `BS.isPrefixOf` out) &&
+       expectContentLength 5 out &&
+       not (hasHeader "Content-Range" out) &&
+       BS.null after)
+
+testFsIfRangeDateExactMatch206 :: Int -> IO Bool
+testFsIfRangeDateExactMatch206 port = do
+  let p = "/fs/spec_ifrange_date_exact.txt"
+  seedFsBody port p "hello"
+
+  mLastMod <- fetchFsHeader port p "Last-Modified"
+  case mLastMod of
+    Nothing -> assert "If-Range exact-date source Last-Modified available" False
+    Just lm ->
+      withConn port $ \s -> do
+        NSB.sendAll s $
+          "GET " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "Range: bytes=2-4\r\n" <>
+          "If-Range: " <> lm <> "\r\n" <>
+          "Connection: close\r\n\r\n"
+        mh <- recvHeaders s
+        case mh of
+          Nothing -> assert "If-Range exact-date 206 headers received" False
+          Just (hdrs, rest0) -> do
+            let okStatus = statusIs "206 Partial Content" hdrs
+                okLen    = expectContentLength 3 hdrs
+                okCR     = headerValue "Content-Range" hdrs == Just "bytes 2-4/5"
+                need     = 3 - BS.length rest0
+            mb <- if need <= 0 then pure (Just (BS.take 3 rest0))
+                               else do
+                                 mmore <- recvExactly s need
+                                 pure ((rest0 <>) <$> mmore)
+            case mb of
+              Nothing   -> assert "If-Range exact-date 206 reads body" False
+              Just body -> assert "If-Range exact date match -> 206"
+                (okStatus && okLen && okCR && body == "llo")
+
+testFsIfRangeDateMismatch200 :: Int -> IO Bool
+testFsIfRangeDateMismatch200 port = do
+  let p = "/fs/spec_ifrange_date_miss.txt"
+      oldDate = "Wed, 01 Jan 2020 00:00:00 GMT"
+  seedFsBody port p "hello"
+
+  withConn port $ \s -> do
+    NSB.sendAll s $
+      "GET " <> p <> " HTTP/1.1\r\n" <>
+      "Host: localhost\r\n" <>
+      "Range: bytes=2-4\r\n" <>
+      "If-Range: " <> oldDate <> "\r\n" <>
+      "Connection: close\r\n\r\n"
+    mh <- recvHeaders s
+    case mh of
+      Nothing -> assert "If-Range mismatch 200 headers received" False
+      Just (hdrs, rest0) -> do
+        let okStatus = statusIs "200 OK" hdrs
+            okLen    = expectContentLength 5 hdrs
+            noCR     = not (hasHeader "Content-Range" hdrs)
+            need     = 5 - BS.length rest0
+        mb <- if need <= 0 then pure (Just (BS.take 5 rest0))
+                           else do
+                             mmore <- recvExactly s need
+                             pure ((rest0 <>) <$> mmore)
+        case mb of
+          Nothing   -> assert "If-Range mismatch 200 reads body" False
+          Just body -> assert "If-Range date mismatch falls back to full 200"
+            (okStatus && okLen && noCR && body == "hello")
+
+testFsIfRangeEtagMatch206 :: Int -> IO Bool
+testFsIfRangeEtagMatch206 port = do
+  let p = "/fs/spec_ifrange_etag.txt"
+  seedFsBody port p "hello"
+
+  mETag <- fetchFsHeader port p "ETag"
+  case mETag of
+    Nothing -> assert "If-Range ETag source ETag available" False
+    Just et ->
+      withConn port $ \s -> do
+        NSB.sendAll s $
+          "GET " <> p <> " HTTP/1.1\r\n" <>
+          "Host: localhost\r\n" <>
+          "Range: bytes=0-1\r\n" <>
+          "If-Range: " <> et <> "\r\n" <>
+          "Connection: close\r\n\r\n"
+        mh <- recvHeaders s
+        case mh of
+          Nothing -> assert "If-Range ETag 206 headers received" False
+          Just (hdrs, rest0) -> do
+            let okStatus = statusIs "206 Partial Content" hdrs
+                okLen    = expectContentLength 2 hdrs
+                okCR     = headerValue "Content-Range" hdrs == Just "bytes 0-1/5"
+                need     = 2 - BS.length rest0
+            mb <- if need <= 0 then pure (Just (BS.take 2 rest0))
+                               else do
+                                 mmore <- recvExactly s need
+                                 pure ((rest0 <>) <$> mmore)
+            case mb of
+              Nothing   -> assert "If-Range ETag 206 reads body" False
+              Just body -> assert "If-Range matching ETag -> 206"
+                (okStatus && okLen && okCR && body == "he")

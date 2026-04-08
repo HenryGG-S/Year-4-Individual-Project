@@ -24,6 +24,7 @@ import Numeric (showHex)
 import System.FilePath ((</>), takeDirectory, takeExtension)
 import qualified System.Directory as Dir
 import System.Timeout (timeout)
+import Control.Applicative ((<|>))
 
 import Http.Body
 import Http.Framing
@@ -193,8 +194,9 @@ handleConn bench sock = loop BS.empty
 
                 Right () ->
                   case decideBodyFraming (rhHeaders headReq) of
-                    Left _ -> do
-                      resp <- responseFor (rhVersion headReq) badRequest ctText "Bad Request\n" True Close []
+                    Left ferr -> do
+                      let (st, msg) = framingErrorResult ferr
+                      resp <- responseFor (rhVersion headReq) st ctText msg True Close []
                       sendBuilder sock resp
 
                     Right framing ->
@@ -459,25 +461,29 @@ serveFsFile ver meth reqHeaders rel sendBody inp pref = do
                   pure (inp, Close, resp)
 
                 Right bs ->
-                  case decideRange reqHeaders st of
-                    ServeFull -> do
-                      resp <- responseFor ver ok ct bs sendBody pref metaHdrs
-                      pure (inp, pref, resp)
+                  let rangeDecision =
+                        case meth of
+                          GET -> decideRange reqHeaders st
+                          _   -> ServeFull
+                  in case rangeDecision of
+                       ServeFull -> do
+                         resp <- responseFor ver ok ct bs sendBody pref metaHdrs
+                         pure (inp, pref, resp)
 
-                    ServeRangeUnsat -> do
-                      let extra =
-                            metaHdrs
-                              ++ [("Content-Range", unsatisfiedContentRange (rsSize st))]
-                      resp <- responseFor ver rangeNotSatisfiable ctText "Range Not Satisfiable\n" True pref extra
-                      pure (inp, pref, resp)
+                       ServeRangeUnsat -> do
+                         let extra =
+                               metaHdrs
+                                 ++ [("Content-Range", unsatisfiedContentRange (rsSize st))]
+                         resp <- responseFor ver rangeNotSatisfiable ctText "Range Not Satisfiable\n" True pref extra
+                         pure (inp, pref, resp)
 
-                    ServePartial start end -> do
-                      let bodyPart = sliceBytes start end bs
-                          extra =
-                            metaHdrs
-                              ++ [("Content-Range", satisfiedContentRange start end (rsSize st))]
-                      resp <- responseFor ver partialContent ct bodyPart sendBody pref extra
-                      pure (inp, pref, resp)
+                       ServePartial start end -> do
+                         let bodyPart = sliceBytes start end bs
+                             extra =
+                               metaHdrs
+                                 ++ [("Content-Range", satisfiedContentRange start end (rsSize st))]
+                         resp <- responseFor ver partialContent ct bodyPart sendBody pref extra
+                         pure (inp, pref, resp)
 
 putFsFile
   :: BS.ByteString
@@ -710,7 +716,15 @@ formatHttpDate =
 
 parseHttpDate :: BS.ByteString -> Maybe UTCTime
 parseHttpDate raw =
-  parseTimeM True defaultTimeLocale httpDateFormat (B8.unpack (trimOWS raw))
+      parseFmt rfc1123
+  <|> parseFmt rfc850
+  <|> parseFmt asctimeFmt
+  where
+    s = B8.unpack (trimOWS raw)
+    parseFmt fmt = parseTimeM True defaultTimeLocale fmt s
+    rfc1123   = "%a, %d %b %Y %H:%M:%S GMT"
+    rfc850    = "%A, %d-%b-%y %H:%M:%S GMT"
+    asctimeFmt = "%a %b %e %H:%M:%S %Y"
 
 normaliseHttpTime :: UTCTime -> UTCTime
 normaliseHttpTime =
@@ -856,7 +870,7 @@ ifRangeAllows hs st =
     raw:_ ->
       case parseIfRangeValue raw of
         Just (IfRangeETag et) -> strongCompare (rsEtag st) et
-        Just (IfRangeDate t)  -> rsMtime st <= normaliseHttpTime t
+        Just (IfRangeDate t)  -> rsMtime st == normaliseHttpTime t
         Nothing               -> False
 
 decideRange :: [Header] -> ResourceState -> RangeDecision
@@ -957,3 +971,10 @@ sendBuilder c b = go (BB.toLazyByteString b)
           let (x, xs) = LBS.splitAt 16384 lbs
           NSB.sendAll c (LBS.toStrict x)
           go xs
+
+framingErrorResult :: FramingError -> (Status, BS.ByteString)
+framingErrorResult ferr =
+  case ferr of
+    ConflictingLength           -> (badRequest, "Bad Request\n")
+    InvalidContentLength        -> (badRequest, "Bad Request\n")
+    UnsupportedTransferEncoding -> (notImplemented, "Not Implemented\n")
