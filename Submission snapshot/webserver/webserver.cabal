@@ -1,0 +1,146 @@
+cabal-version: 2.2
+
+-- This file has been generated from package.yaml by hpack version 0.38.1.
+--
+-- see: https://github.com/sol/hpack
+
+name:           webserver
+version:        0.1.0.0
+synopsis:       Lean HTTP/1.1 server in Haskell for tail-latency benchmarking
+description:    Lean, standards-aware HTTP/1.1 server in Haskell for a dissertation studying tail latency under open-loop load, with benchmark tooling and cross-implementation comparison baselines.
+category:       Web
+homepage:       https://github.com/HenryGG-S/Year-4-Individual-Project#readme
+bug-reports:    https://github.com/HenryGG-S/Year-4-Individual-Project/issues
+author:         Henry G. G-S.
+maintainer:     Henry G. G-S.
+copyright:      2026 Henry G. G-S.
+license:        BSD-3-Clause
+license-file:   LICENSE
+build-type:     Simple
+extra-source-files:
+    README.md
+    CHANGELOG.md
+
+source-repository head
+  type: git
+  location: https://github.com/HenryGG-S/Year-4-Individual-Project
+
+library
+  exposed-modules:
+      Lib
+      Server
+      Http.Types
+      Http.Parse
+      Http.Response
+      Workloads
+  other-modules:
+      Http.Body
+      Http.Framing
+      Paths_webserver
+  autogen-modules:
+      Paths_webserver
+  hs-source-dirs:
+      src
+  default-extensions:
+      OverloadedStrings
+      NumericUnderscores
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  build-depends:
+      attoparsec
+    , base >=4.14 && <5
+    , bytestring
+    , case-insensitive
+    , directory
+    , filepath
+    , http-types
+    , network
+    , text
+    , time
+    , wai
+    , warp
+  default-language: Haskell2010
+
+executable warp-baseline
+  main-is: Main.hs
+  other-modules:
+      Paths_webserver
+  autogen-modules:
+      Paths_webserver
+  hs-source-dirs:
+      app-warp
+  default-extensions:
+      OverloadedStrings
+      NumericUnderscores
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -O2 -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      attoparsec
+    , base >=4.14 && <5
+    , bytestring
+    , case-insensitive
+    , directory
+    , filepath
+    , http-types
+    , network
+    , text
+    , time
+    , wai
+    , warp
+    , webserver
+  default-language: Haskell2010
+
+executable webserver-exe
+  main-is: Main.hs
+  other-modules:
+      Paths_webserver
+  autogen-modules:
+      Paths_webserver
+  hs-source-dirs:
+      app
+  default-extensions:
+      OverloadedStrings
+      NumericUnderscores
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -O2 -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      attoparsec
+    , base >=4.14 && <5
+    , bytestring
+    , case-insensitive
+    , directory
+    , filepath
+    , http-types
+    , network
+    , text
+    , time
+    , wai
+    , warp
+    , webserver
+  default-language: Haskell2010
+
+test-suite webserver-test
+  type: exitcode-stdio-1.0
+  main-is: Spec.hs
+  other-modules:
+      Paths_webserver
+  autogen-modules:
+      Paths_webserver
+  hs-source-dirs:
+      test
+  default-extensions:
+      OverloadedStrings
+      NumericUnderscores
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -O2 -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      attoparsec
+    , base >=4.14 && <5
+    , bytestring
+    , case-insensitive
+    , directory
+    , filepath
+    , http-types
+    , network
+    , text
+    , time
+    , wai
+    , warp
+    , webserver
+  default-language: Haskell2010

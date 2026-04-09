@@ -30,8 +30,7 @@ This repository contains the implementation and benchmarking code for a disserta
 ## Quick start
 
 ```bash
-git clone https://github.com/HenryGG-S/Year-4-Individual-Project.git
-cd Year-4-Individual-Project/webserver
+cd webserver
 
 stack setup
 stack build

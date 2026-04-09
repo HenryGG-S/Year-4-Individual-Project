@@ -1,0 +1,13 @@
+requests=17855
+duration_s=60.003793
+bytes=916729265
+rps=297.56
+p50_ms=1.965
+p95_ms=4.691
+p99_ms=5.903
+p999_ms=7.159
+err_connect=0
+err_read=0
+err_write=0
+err_status=0
+err_timeout=0

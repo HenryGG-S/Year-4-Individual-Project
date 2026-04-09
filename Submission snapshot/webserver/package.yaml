@@ -1,0 +1,102 @@
+name:                webserver
+version:             0.1.0.0
+github:              "HenryGG-S/Year-4-Individual-Project"
+license:             BSD-3-Clause
+author:              "Henry G. G-S."
+maintainer:          "Henry G. G-S."
+copyright:           "2026 Henry G. G-S."
+
+synopsis:            "Lean HTTP/1.1 server in Haskell for tail-latency benchmarking"
+category:            Web
+description: >
+  Lean, standards-aware HTTP/1.1 server in Haskell for a dissertation
+  studying tail latency under open-loop load, with benchmark tooling and
+  cross-implementation comparison baselines.
+
+extra-source-files:
+- README.md
+- CHANGELOG.md
+
+dependencies:
+  - base >= 4.14 && < 5
+  - bytestring
+  - network
+  - attoparsec
+  - case-insensitive
+  - wai
+  - warp
+  - http-types
+  - text
+  - directory
+  - filepath
+  - time
+
+ghc-options:
+- -Wall
+- -Wcompat
+- -Widentities
+- -Wincomplete-record-updates
+- -Wincomplete-uni-patterns
+- -Wmissing-export-lists
+- -Wmissing-home-modules
+- -Wpartial-fields
+- -Wredundant-constraints
+
+default-extensions:
+  - OverloadedStrings
+  - NumericUnderscores
+
+library:
+  source-dirs: src
+  exposed-modules:
+    - Lib
+    - Server
+    - Http.Types
+    - Http.Parse
+    - Http.Response
+    - Workloads
+
+executables:
+  webserver-exe:
+    main: Main.hs
+    source-dirs: app
+    dependencies:
+      - webserver
+    ghc-options:
+      - -O2
+      - -Wall
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+
+  warp-baseline:
+    main: Main.hs
+    source-dirs: app-warp
+    dependencies:
+      - webserver
+      - wai
+      - warp
+      - http-types
+      - text
+    ghc-options:
+      - -O2
+      - -Wall
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+
+
+tests:
+  webserver-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -O2
+    - -Wall
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - webserver
+    - bytestring
+    - network

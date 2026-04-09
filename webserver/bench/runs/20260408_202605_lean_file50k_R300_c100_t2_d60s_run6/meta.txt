@@ -1,0 +1,43 @@
+timestamp=20260408_202605
+name=lean_file50k
+run_index=6
+url=http://127.0.0.1:8080/file50k
+rate_rps=300
+duration_s=60
+threads=2
+connections=100
+wrk_cmd=wrk2
+git_commit=7e417aa72d0042893192e93e48a7d733b6e7de20
+uname=Linux home-desktop 6.8.0-106-generic #106-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar  6 07:58:08 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+ulimit_n=1024
+stack_version=Version 3.7.1, Git revision 331f4880f1a33f1d39e14317dc9ecc6d3d6d617d x86_64 hpack-0.38.1
+ghc_version=The Glorious Glasgow Haskell Compilation System, version 9.10.3
+wrk_version=wrk 4.0.0 [epoll] Copyright (C) 2012 Will Glozer
+Usage: wrk <options> <url>                            
+  Options:                                            
+    -c, --connections <N>  Connections to keep open   
+    -d, --duration    <T>  Duration of test           
+    -t, --threads     <N>  Number of threads to use   
+                                                      
+    -s, --script      <S>  Load Lua script file       
+    -H, --header      <H>  Add header to request      
+    -L  --latency          Print latency statistics   
+    -U  --u_latency        Print uncorrected latency statistics
+        --timeout     <T>  Socket/request timeout     
+    -B, --batch_latency    Measure latency of whole   
+                           batches of pipelined ops   
+                           (as opposed to each op)    
+    -v, --version          Print version details      
+    -R, --rate        <T>  work rate (throughput)     
+                           in requests/sec (total)    
+                           [Required Parameter]       
+                                                      
+                                                      
+  Numeric arguments may include a SI unit (1k, 1M, 1G)
+  Time arguments may include a time unit (2s, 2m, 2h)
+bench_json1k_sha256=9165f2861a0b2544b337812549a8b834b343b65ebdf7ce83ef7f44755020a797
+bench_file50k_sha256=43fbcc7a82a22e49c6327683ad32eaca0a6a7a66196725159c6d5e24ee240923
+bench_file1m_sha256=a1e6a4fbbcebc46f5153f7ca519083e49a3d8b4bb2f5c5f22657f44a6becc2c2
+baseline_json1k_sha256=9165f2861a0b2544b337812549a8b834b343b65ebdf7ce83ef7f44755020a797
+baseline_file50k_sha256=43fbcc7a82a22e49c6327683ad32eaca0a6a7a66196725159c6d5e24ee240923
+baseline_file1m_sha256=a1e6a4fbbcebc46f5153f7ca519083e49a3d8b4bb2f5c5f22657f44a6becc2c2
