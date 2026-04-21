@@ -1,7 +1,9 @@
 module Main where
 
 import Server (runServer)
+import System.Environment (lookupEnv)
 
 main :: IO ()
-main = runServer "8080"
-
+main = do
+  mPort <- lookupEnv "PORT"
+  runServer (maybe "8080" id mPort)

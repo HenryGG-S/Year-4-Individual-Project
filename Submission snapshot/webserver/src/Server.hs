@@ -5,8 +5,9 @@ module Server
   ) where
 
 import Control.Concurrent (forkFinally)
-import Control.Exception (IOException, bracket, catch, try)
-import Control.Monad (when)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Exception (IOException, bracket, catch, try, evaluate)
+import Control.Monad (when, unless)
 import qualified Data.Attoparsec.ByteString as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -14,17 +15,23 @@ import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.CaseInsensitive as CI
 import Data.Char (toLower)
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Maybe (mapMaybe)
 import Data.Time.Clock (UTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+import Data.Word (Word64)
+import GHC.Clock (getMonotonicTimeNSec)
 import qualified Network.Socket as NS
 import qualified Network.Socket.ByteString as NSB
 import Numeric (showHex)
+import System.Environment (lookupEnv)
 import System.FilePath ((</>), takeDirectory, takeExtension)
 import qualified System.Directory as Dir
+import System.IO.Unsafe (unsafePerformIO)
 import System.Timeout (timeout)
 import Control.Applicative ((<|>))
+import Text.Read (readMaybe)
 
 import Http.Body
 import Http.Framing
@@ -225,8 +232,15 @@ handleConn bench sock = loop BS.empty
                           when (expect100 && willReadBody) $
                             NSB.sendAll sock "HTTP/1.1 100 Continue\r\n\r\n"
 
-                          (inp1, finalPref, resp) <- dispatch bench headReq path0 framing pref inp0
-                          sendBuilder sock resp
+
+                          mTraceSeed <-
+                            if rhMethod headReq == GET
+                              then maybeStartTrace path0
+                              else pure Nothing
+
+                          (inp1, finalPref, resp, mPendingTrace) <-
+                            dispatch bench headReq path0 framing pref inp0 mTraceSeed
+                          sendBuilderMaybeProfiled sock resp mPendingTrace
 
                           case finalPref of
                             Close     -> pure ()
@@ -241,8 +255,9 @@ dispatch
   -> BodyFraming
   -> ConnectionPref
   -> Input
-  -> IO (Input, ConnectionPref, BB.Builder)
-dispatch bench headReq path framing pref inp0 =
+  -> Maybe TraceSeed
+  -> IO (Input, ConnectionPref, BB.Builder, Maybe PendingTrace)
+dispatch bench headReq path framing pref inp0 mTraceSeed =
   case (rhMethod headReq, path) of
 
     -- ===== benchmark endpoints (preloaded from disk) =====
@@ -304,21 +319,26 @@ dispatch bench headReq path framing pref inp0 =
     -- ===== filesystem-backed resource routes =====
     (GET, p) | Just rel <- fsRelPath p ->
       withDrained $ \inp1 ->
-        serveFsFile ver GET (rhHeaders headReq) rel True inp1 pref
+        noTrace $
+          serveFsFile ver GET (rhHeaders headReq) rel True inp1 pref
 
     (HEAD, p) | Just rel <- fsRelPath p ->
       withDrained $ \inp1 ->
-        serveFsFile ver HEAD (rhHeaders headReq) rel False inp1 pref
+        noTrace $
+          serveFsFile ver HEAD (rhHeaders headReq) rel False inp1 pref
 
     (PUT, p) | Just rel <- fsRelPath p ->
-      putFsFile ver PUT (rhHeaders headReq) rel framing inp0 pref False
+      noTrace $
+        putFsFile ver PUT (rhHeaders headReq) rel framing inp0 pref False
 
     (POST, p) | Just rel <- fsRelPath p ->
-      putFsFile ver POST (rhHeaders headReq) rel framing inp0 pref True
+      noTrace $
+        putFsFile ver POST (rhHeaders headReq) rel framing inp0 pref True
 
     (DELETE, p) | Just rel <- fsRelPath p ->
       withDrained $ \inp1 ->
-        delFsFile ver (rhHeaders headReq) rel inp1 pref
+        noTrace $
+          delFsFile ver (rhHeaders headReq) rel inp1 pref
 
     -- OPTIONS * minimal
     (OPTIONS, "*") ->
@@ -344,6 +364,13 @@ dispatch bench headReq path framing pref inp0 =
   where
     ver = rhVersion headReq
 
+    noTrace
+      :: IO (Input, ConnectionPref, BB.Builder)
+      -> IO (Input, ConnectionPref, BB.Builder, Maybe PendingTrace)
+    noTrace action = do
+      (inp1, pref1, resp) <- action
+      pure (inp1, pref1, resp, Nothing)
+
     respond
       :: Input
       -> ConnectionPref
@@ -352,14 +379,21 @@ dispatch bench headReq path framing pref inp0 =
       -> BS.ByteString
       -> Bool
       -> [(BS.ByteString, BS.ByteString)]
-      -> IO (Input, ConnectionPref, BB.Builder)
-    respond inp1 pref1 st ct body sendBody extra = do
-      resp <- responseFor ver st ct body sendBody pref1 extra
-      pure (inp1, pref1, resp)
+      -> IO (Input, ConnectionPref, BB.Builder, Maybe PendingTrace)
+    respond inp1 pref1 st ct body sendBody extra =
+      case mTraceSeed of
+        Nothing -> do
+          resp <- responseFor ver st ct body sendBody pref1 extra
+          pure (inp1, pref1, resp, Nothing)
+
+        Just seed -> do
+          (resp, buildNs) <- timedNs $
+            responseFor ver st ct body sendBody pref1 extra
+          pure (inp1, pref1, resp, Just (finishTraceBuild seed buildNs))
 
     withDrained
-      :: (Input -> IO (Input, ConnectionPref, BB.Builder))
-      -> IO (Input, ConnectionPref, BB.Builder)
+      :: (Input -> IO (Input, ConnectionPref, BB.Builder, Maybe PendingTrace))
+      -> IO (Input, ConnectionPref, BB.Builder, Maybe PendingTrace)
     withDrained k = do
       ed <- drainBody framing inp0
       case ed of
@@ -369,10 +403,10 @@ dispatch bench headReq path framing pref inp0 =
     bodyErrorResult
       :: Input
       -> BodyError
-      -> IO (Input, ConnectionPref, BB.Builder)
+      -> IO (Input, ConnectionPref, BB.Builder, Maybe PendingTrace)
     bodyErrorResult inp e = do
       resp <- responseFor ver (bodyErrorStatus e) ctText (bodyErrorMessage e) True Close []
-      pure (inp, Close, resp)
+      pure (inp, Close, resp, Nothing)
 
 -- ===== /fs helpers =====
 
@@ -939,6 +973,117 @@ unsatisfiedContentRange total =
 bsShowI :: Integer -> BS.ByteString
 bsShowI = B8.pack . show
 
+-- ===== Lightweight stage profiling =====
+
+data TraceCfg = TraceCfg
+  { tcEnabled     :: !Bool
+  , tcSampleEvery :: !Int
+  , tcOutCsv      :: !FilePath
+  }
+
+data TraceSeed = TraceSeed
+  { tsLabel      :: !BS.ByteString
+  , tsReqStartNs :: !Word64
+  }
+
+data PendingTrace = PendingTrace
+  { ptLabel      :: !BS.ByteString
+  , ptReqStartNs :: !Word64
+  , ptBuildNs    :: !Word64
+  }
+
+{-# NOINLINE traceCfg #-}
+traceCfg :: TraceCfg
+traceCfg = unsafePerformIO initTraceCfg
+
+{-# NOINLINE traceCounter #-}
+traceCounter :: IORef Int
+traceCounter = unsafePerformIO (newIORef 0)
+
+{-# NOINLINE traceCsvLock #-}
+traceCsvLock :: MVar ()
+traceCsvLock = unsafePerformIO (newMVar ())
+
+initTraceCfg :: IO TraceCfg
+initTraceCfg = do
+  mEnabled <- lookupEnv "PROFILE_STAGES"
+  mEvery   <- lookupEnv "PROFILE_SAMPLE_EVERY"
+  mOut     <- lookupEnv "PROFILE_STAGE_CSV"
+  let enabled =
+        case fmap (map toLower) mEnabled of
+          Just "1"    -> True
+          Just "true" -> True
+          Just "yes"  -> True
+          Just "on"   -> True
+          _           -> False
+
+      sampleEvery =
+        max 1 $
+          case mEvery >>= readMaybe of
+            Just n  -> n
+            Nothing -> 50
+
+      outCsv =
+        case mOut of
+          Just p  -> p
+          Nothing -> "bench/stage_times.csv"
+
+  pure TraceCfg
+    { tcEnabled = enabled
+    , tcSampleEvery = sampleEvery
+    , tcOutCsv = outCsv
+    }
+
+shouldTracePath :: BS.ByteString -> Bool
+shouldTracePath p =
+  p == "/json" || p == "/file1m"
+
+timedNs :: IO a -> IO (a, Word64)
+timedNs action = do
+  t0 <- getMonotonicTimeNSec
+  x  <- action
+  t1 <- getMonotonicTimeNSec
+  pure (x, t1 - t0)
+
+maybeStartTrace :: BS.ByteString -> IO (Maybe TraceSeed)
+maybeStartTrace path
+  | not (tcEnabled traceCfg) = pure Nothing
+  | not (shouldTracePath path) = pure Nothing
+  | otherwise = do
+      n <- atomicModifyIORef' traceCounter $ \i ->
+        let j = i + 1
+        in (j, j)
+
+      if n `mod` tcSampleEvery traceCfg == 0
+        then do
+          t0 <- getMonotonicTimeNSec
+          pure (Just (TraceSeed path t0))
+        else pure Nothing
+
+finishTraceBuild :: TraceSeed -> Word64 -> PendingTrace
+finishTraceBuild seed buildNs =
+  PendingTrace
+    { ptLabel = tsLabel seed
+    , ptReqStartNs = tsReqStartNs seed
+    , ptBuildNs = buildNs
+    }
+
+appendTraceCsv :: PendingTrace -> Word64 -> Word64 -> Word64 -> IO ()
+appendTraceCsv pending toLazyNs sendNs totalNs =
+  withMVar traceCsvLock $ \_ -> do
+    let out = tcOutCsv traceCfg
+    Dir.createDirectoryIfMissing True (takeDirectory out)
+    exists <- Dir.doesFileExist out
+    unless exists $
+      appendFile out "endpoint,build_ns,to_lazy_ns,send_ns,total_ns\n"
+
+    appendFile out $
+         B8.unpack (ptLabel pending) <> ","
+      <> show (ptBuildNs pending)    <> ","
+      <> show toLazyNs               <> ","
+      <> show sendNs                 <> ","
+      <> show totalNs                <> "\n"
+
 -- ===== Response helpers =====
 
 responseFor
@@ -963,14 +1108,34 @@ httpDate =
   B8.pack . formatTime defaultTimeLocale httpDateFormat <$> getCurrentTime
 
 sendBuilder :: NS.Socket -> BB.Builder -> IO ()
-sendBuilder c b = go (BB.toLazyByteString b)
-  where
-    go lbs
-      | LBS.null lbs = pure ()
-      | otherwise = do
-          let (x, xs) = LBS.splitAt 16384 lbs
-          NSB.sendAll c (LBS.toStrict x)
-          go xs
+sendBuilder c b =
+  sendLazyChunks c (BB.toLazyByteString b)
+
+sendBuilderMaybeProfiled :: NS.Socket -> BB.Builder -> Maybe PendingTrace -> IO ()
+sendBuilderMaybeProfiled c b Nothing =
+  sendBuilder c b
+
+sendBuilderMaybeProfiled c b (Just pending) = do
+  (lbs, toLazyNs) <- timedNs $ do
+    let lbs = BB.toLazyByteString b
+    _ <- evaluate lbs
+    pure lbs
+
+  (_, sendNs) <- timedNs $
+    sendLazyChunks c lbs
+
+  t1 <- getMonotonicTimeNSec
+  let totalNs = t1 - ptReqStartNs pending
+
+  appendTraceCsv pending toLazyNs sendNs totalNs
+
+sendLazyChunks :: NS.Socket -> LBS.ByteString -> IO ()
+sendLazyChunks c lbs
+  | LBS.null lbs = pure ()
+  | otherwise = do
+      let (x, xs) = LBS.splitAt 16384 lbs
+      NSB.sendAll c (LBS.toStrict x)
+      sendLazyChunks c xs
 
 framingErrorResult :: FramingError -> (Status, BS.ByteString)
 framingErrorResult ferr =
