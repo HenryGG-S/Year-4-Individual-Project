@@ -1,0 +1,3 @@
+timestamp,name,run_index,url,rate_rps,duration_s,threads,connections,requests,achieved_rps,p50_ms,p95_ms,p99_ms,p999_ms,err_connect,err_read,err_write,err_status,err_timeout,exit_code,run_dir
+20260421_191037,lean_file1m_profile,1,http://127.0.0.1:18082/file1m,50,30,2,50,1502,50.05,3.821,44.575,46.687,51.167,0,0,0,0,0,0,/home/henry/Documents/Year-4-Individual-Project/webserver/bench/runs/20260421_191037_lean_file1m_profile_R50_c50_t2_d30s_run1
+20260421_191120,lean_json_profile,1,http://127.0.0.1:18083/json,2000,30,2,100,58007,1933.37,4.747,9.919,12.431,15.911,0,0,0,0,0,0,/home/henry/Documents/Year-4-Individual-Project/webserver/bench/runs/20260421_191120_lean_json_profile_R2000_c100_t2_d30s_run1

@@ -1,0 +1,4 @@
+timestamp,name,run_index,url,rate_rps,duration_s,threads,connections,requests,achieved_rps,p50_ms,p95_ms,p99_ms,p999_ms,err_connect,err_read,err_write,err_status,err_timeout,exit_code,run_dir
+20260417_162235,lean_file1m_profile,1,http://127.0.0.1:8080/file1m,50,30,2,50,1502,50.05,3.823,44.799,46.207,48.831,0,0,0,0,0,0,/home/henry/Documents/Year-4-Individual-Project/webserver/bench/runs/20260417_162235_lean_file1m_profile_R50_c50_t2_d30s_run1
+20260417_162524,lean_json_profile,1,http://127.0.0.1:8080/json,2000,30,2,100,59797,1993.24,1.361,3.027,4.077,5.227,0,0,0,0,0,0,/home/henry/Documents/Year-4-Individual-Project/webserver/bench/runs/20260417_162524_lean_json_profile_R2000_c100_t2_d30s_run1
+20260417_163121,lean_file1m_profile,1,http://127.0.0.1:8080/file1m,50,30,2,50,1502,50.06,3.861,45.119,46.591,51.007,0,0,0,0,0,0,/home/henry/Documents/Year-4-Individual-Project/webserver/bench/runs/20260417_163121_lean_file1m_profile_R50_c50_t2_d30s_run1
