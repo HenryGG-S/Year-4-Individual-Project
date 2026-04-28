@@ -117,7 +117,7 @@ The submission instead contains curated benchmark artefacts under bench/:
 - environment_latest.txt
 - raw_runs_latest.csv
 - trimmed_summary_latest.csv
-- summary.csv
+
 
 Typical outputs include:
 - raw `wrk2` output

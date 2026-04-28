@@ -1,6 +1,6 @@
 -- scripts/wrk2_metrics.lua
 done = function(summary, latency, requests)
-  local function ms(us) return us / 1000.0 end  -- wrk2 latency values are microseconds :contentReference[oaicite:6]{index=6}
+  local function ms(us) return us / 1000.0 end  -- wrk2 latency values are microseconds
 
   io.write("\n--- metrics ---\n")
   io.write(string.format("requests=%d\n", summary.requests))
